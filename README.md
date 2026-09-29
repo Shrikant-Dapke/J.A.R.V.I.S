@@ -40,5 +40,23 @@ JARVIS v0.1 excludes unrestricted shell execution, a custom operating system, a 
 - [Software Requirements Specification](docs/SRS.md)
 - [System Architecture](docs/SYSTEM_ARCHITECTURE.md)
 
+## Backend Setup
+
+```bash
+cd backend
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
+uvicorn app.main:app --reload
+```
+
+Health check: `GET http://127.0.0.1:8000/api/health`
+
+Run tests:
+```bash
+pytest tests/ -v
+```
+
 ## Status
 **Phase 0 — Foundation**
