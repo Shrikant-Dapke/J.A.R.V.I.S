@@ -1,0 +1,1 @@
+"""LLM provider package (text-generation boundary only)."""
