@@ -5,6 +5,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.policy import RiskLevel
 from app.schemas.tool import ToolResult
 from app.services.tool_base import Tool
 
@@ -42,6 +43,7 @@ class CreateDirectoryTool(Tool[CreateDirectoryInput]):
     )
     read_only: ClassVar[bool] = False
     requires_approval: ClassVar[bool] = True
+    risk_level: ClassVar[RiskLevel] = RiskLevel.LOW_RISK
     input_model: ClassVar[type[CreateDirectoryInput]] = CreateDirectoryInput
 
     def __init__(self, approved_root: Path | str = DEFAULT_APPROVED_ROOT) -> None:

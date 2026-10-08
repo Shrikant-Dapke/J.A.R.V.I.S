@@ -5,6 +5,8 @@ from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.schemas.policy import RiskLevel
+
 
 MAX_TOOL_NAME_LENGTH = 64
 MAX_TOOL_DESCRIPTION_LENGTH = 512
@@ -184,4 +186,8 @@ class ToolDefinition(BaseModel):
     input_schema: dict[str, Any] = Field(
         default_factory=dict,
         description="JSON schema for the typed input model",
+    )
+    risk_level: Optional[RiskLevel] = Field(
+        default=None,
+        description="Policy risk classification for this tool",
     )

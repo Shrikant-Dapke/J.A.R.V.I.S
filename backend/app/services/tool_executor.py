@@ -30,7 +30,6 @@ class ToolExecutor:
             )
         return registered.invoke(arguments)
 
-
 default_tool_executor = ToolExecutor(tool_registry)
 
 

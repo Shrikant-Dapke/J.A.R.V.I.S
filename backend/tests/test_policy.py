@@ -7,6 +7,7 @@ from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.schemas.tool import ToolDefinition
 from app.services.policy_service import evaluate_tool_policy
+from app.services.open_application_tool import TOOL_NAME as OPEN_APPLICATION_TOOL
 from app.services.system_info_tool import TOOL_NAME
 from app.services.tool_executor import execute_authorized_tool
 from app.services.tool_registry import ToolRegistry, tool_registry
@@ -95,7 +96,7 @@ def test_policy_never_executes_tools():
 
 
 def test_executor_rejects_unimplemented_tool():
-    """Executor has no dynamic dispatch; unknown names raise ValueError."""
+    """Executor rejects unknown names and metadata-only definitions."""
     with pytest.raises(ValueError):
         execute_authorized_tool("no_such_tool_xyz")
     with pytest.raises(ValueError):
@@ -136,15 +137,18 @@ async def test_invoke_unknown_tool_404(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_invoke_approval_required_tool_403(client: AsyncClient):
-    """Approval-gated tool returns structured 403, never executes."""
+async def test_invoke_approval_required_tool_returns_pending(client: AsyncClient):
+    """Approval-gated tool creates a pending request, never executes."""
     response = await client.post(
-        f"/api/tools/{APPROVAL_TOOL_NAME}/invoke", json={}
+        f"/api/tools/{OPEN_APPLICATION_TOOL}/invoke",
+        json={"arguments": {"app_id": "notepad"}},
     )
-    assert response.status_code == 403
+    assert response.status_code == 202
     data = response.json()
-    assert data["error"]["code"] == "HTTP_403"
-    assert "request_id" in data["error"]
+    assert data["tool_name"] == OPEN_APPLICATION_TOOL
+    assert data["arguments"] == {"app_id": "notepad"}
+    assert data["status"] == "PENDING"
+    assert data["risk_level"] == "LOW_RISK"
 
 
 @pytest.mark.asyncio

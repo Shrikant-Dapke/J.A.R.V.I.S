@@ -6,6 +6,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.schemas.policy import RiskLevel
 from app.schemas.tool import ToolResult
 from app.services.tool_base import Tool
 
@@ -38,6 +39,7 @@ class OpenApplicationTool(Tool[OpenApplicationInput]):
     description: ClassVar[str] = "Open a registered Windows application alias."
     read_only: ClassVar[bool] = False
     requires_approval: ClassVar[bool] = True
+    risk_level: ClassVar[RiskLevel] = RiskLevel.LOW_RISK
     input_model: ClassVar[type[OpenApplicationInput]] = OpenApplicationInput
 
     def execute(self, arguments: OpenApplicationInput) -> ToolResult:

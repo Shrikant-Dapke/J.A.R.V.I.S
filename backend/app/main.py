@@ -12,6 +12,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.api.chat import router as chat_router
 from app.api.conversations import router as conversations_router
+from app.api.approvals import router as approvals_router
 from app.api.system_info import router as system_info_router
 from app.api.tools import router as tools_router
 from app.core.config import settings
@@ -183,6 +184,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 
 app.include_router(chat_router)
 app.include_router(conversations_router)
+app.include_router(approvals_router)
 app.include_router(system_info_router)
 app.include_router(tools_router)
 

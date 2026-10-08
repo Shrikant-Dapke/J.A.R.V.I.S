@@ -8,6 +8,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict
 
+from app.schemas.policy import RiskLevel
 from app.schemas.tool import ToolResult
 from app.services.tool_base import Tool
 
@@ -60,6 +61,7 @@ class SystemInfoTool(Tool[GetSystemInfoInput]):
     )
     read_only: ClassVar[bool] = True
     requires_approval: ClassVar[bool] = False
+    risk_level: ClassVar[RiskLevel] = RiskLevel.READ_ONLY
     input_model: ClassVar[type[GetSystemInfoInput]] = GetSystemInfoInput
 
     def execute(self, arguments: GetSystemInfoInput) -> ToolResult:
