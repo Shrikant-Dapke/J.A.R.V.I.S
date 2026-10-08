@@ -4,7 +4,8 @@ from fastapi import APIRouter, status
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.schemas.tool import ToolResult
-from app.services.system_info_tool import TOOL_NAME, get_system_info
+from app.services.system_info_tool import TOOL_NAME
+from app.services.tool_executor import execute_authorized_tool
 from app.services.tool_registry import tool_registry
 
 
@@ -29,4 +30,4 @@ async def system_info() -> ToolResult:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Tool '{TOOL_NAME}' is not read-only",
         )
-    return get_system_info()
+    return execute_authorized_tool(TOOL_NAME)

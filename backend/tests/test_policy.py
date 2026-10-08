@@ -113,7 +113,7 @@ async def test_invoke_system_info_succeeds(client: AsyncClient):
     data = response.json()
     assert data["tool_name"] == TOOL_NAME
     assert data["status"] == "success"
-    assert data["payload"]["os"] == "Windows"
+    assert data["payload"]["operating_system"]
     assert data["timestamp"]
 
 

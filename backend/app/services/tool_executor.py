@@ -1,23 +1,52 @@
-"""Execution boundary: runs already-authorized tools, decides nothing.
+"""Execution boundary for tools that have already been authorized."""
 
-Callers MUST evaluate policy first. This module performs no
-authorization, no registry lookup, and no dynamic dispatch:
-every executable tool has an explicit branch below.
-"""
+from typing import Any, Mapping, Optional
 
 from app.schemas.tool import ToolResult
-from app.services.system_info_tool import TOOL_NAME as SYSTEM_INFO_TOOL
-from app.services.system_info_tool import get_system_info
+from app.services.tool_base import Tool
+from app.services.tool_registry import ToolRegistry, UnknownToolError, tool_registry
 
 
-def execute_authorized_tool(tool_name: str) -> ToolResult:
-    """
-    Execute an already-authorized registered tool.
+class ToolNotImplementedError(ValueError):
+    """Raised when metadata exists but no executable implementation is bound."""
 
-    Raises:
-        ValueError: If the tool has no registered implementation.
-    """
-    if tool_name == SYSTEM_INFO_TOOL:
-        return get_system_info()
 
-    raise ValueError(f"Tool '{tool_name}' has no registered implementation")
+class ToolExecutor:
+    """Invoke registered implementations without making policy decisions."""
+
+    def __init__(self, registry: ToolRegistry) -> None:
+        self._registry = registry
+
+    def execute(
+        self,
+        tool_name: str,
+        arguments: Optional[Mapping[str, Any]] = None,
+    ) -> ToolResult:
+        """Execute one registered tool; callers must perform authorization first."""
+        registered = self._registry.require(tool_name)
+        if not isinstance(registered, Tool):
+            raise ToolNotImplementedError(
+                f"Tool '{tool_name}' has no registered implementation"
+            )
+        return registered.invoke(arguments)
+
+
+default_tool_executor = ToolExecutor(tool_registry)
+
+
+def execute_authorized_tool(
+    tool_name: str,
+    arguments: Optional[Mapping[str, Any]] = None,
+    registry: Optional[ToolRegistry] = None,
+) -> ToolResult:
+    """Compatibility function for the internal authorized execution boundary."""
+    executor = default_tool_executor if registry is None else ToolExecutor(registry)
+    return executor.execute(tool_name, arguments)
+
+
+__all__ = [
+    "ToolExecutor",
+    "ToolNotImplementedError",
+    "UnknownToolError",
+    "execute_authorized_tool",
+]

@@ -29,8 +29,6 @@ async def invoke_tool(
     Only policy-allowed tools reach the executor. Arguments are accepted
     as bounded structured data; get_system_info ignores them (takes none).
     """
-    _ = request  # Reserved for future per-tool argument binding.
-
     if tool_registry.get(name) is None:
         raise StarletteHTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -49,4 +47,5 @@ async def invoke_tool(
             detail=f"Tool '{name}' is not permitted: {decision.reason}",
         )
 
-    return execute_authorized_tool(name)
+    arguments = request.arguments if request is not None else None
+    return execute_authorized_tool(name, arguments)

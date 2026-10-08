@@ -1,39 +1,92 @@
-"""Deterministic read-only get_system_info stub (no machine inspection).
+"""Bounded read-only system information tool."""
 
-Returns fixed placeholder values only. Real system inspection is
-explicitly out of scope for this phase.
-"""
+import ctypes
+import os
+import platform
+import socket
+from typing import ClassVar
 
-from app.schemas.tool import ToolDefinition, ToolResult
-from app.services.tool_registry import tool_registry
+from pydantic import BaseModel, ConfigDict
+
+from app.schemas.tool import ToolResult
+from app.services.tool_base import Tool
 
 
 TOOL_NAME = "get_system_info"
 
-TOOL_DEFINITION = ToolDefinition(
-    name=TOOL_NAME,
-    description="Return bounded placeholder system information (stub).",
-    read_only=True,
-    requires_approval=False,
-)
 
-PLACEHOLDER_PAYLOAD: dict[str, str] = {
-    "os": "Windows",
-    "platform": "placeholder",
-    "hostname": "placeholder",
-    "architecture": "x64",
-}
+class GetSystemInfoInput(BaseModel):
+    """This read-only tool does not accept any arguments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+def _total_memory_gb() -> str:
+    """Return total RAM using platform APIs without reading environment data."""
+    if os.name == "nt":
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("length", ctypes.c_ulong),
+                ("memory_load", ctypes.c_ulong),
+                ("total_physical", ctypes.c_ulonglong),
+                ("available_physical", ctypes.c_ulonglong),
+                ("total_page_file", ctypes.c_ulonglong),
+                ("available_page_file", ctypes.c_ulonglong),
+                ("total_virtual", ctypes.c_ulonglong),
+                ("available_virtual", ctypes.c_ulonglong),
+                ("available_extended_virtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(MemoryStatus)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return f"{status.total_physical / (1024 ** 3):.1f} GB"
+        return "unavailable"
+
+    try:
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        page_count = os.sysconf("SC_PHYS_PAGES")
+        return f"{(page_size * page_count) / (1024 ** 3):.1f} GB"
+    except (AttributeError, OSError, ValueError):
+        return "unavailable"
+
+
+class SystemInfoTool(Tool[GetSystemInfoInput]):
+    """Return a documented set of non-sensitive host information."""
+
+    name: ClassVar[str] = TOOL_NAME
+    description: ClassVar[str] = (
+        "Return bounded non-sensitive operating system and runtime information."
+    )
+    read_only: ClassVar[bool] = True
+    requires_approval: ClassVar[bool] = False
+    input_model: ClassVar[type[GetSystemInfoInput]] = GetSystemInfoInput
+
+    def execute(self, arguments: GetSystemInfoInput) -> ToolResult:
+        del arguments
+        processor = platform.processor() or platform.machine() or "unavailable"
+        data = {
+            "operating_system": platform.system() or "unavailable",
+            "os_version": platform.version() or "unavailable",
+            "hostname": socket.gethostname(),
+            "cpu": processor,
+            "cpu_count": str(os.cpu_count() or "unavailable"),
+            "ram": _total_memory_gb(),
+            "python_version": platform.python_version(),
+        }
+        return ToolResult.success_result(
+            tool_name=self.name,
+            message="System information retrieved.",
+            data=data,
+        )
+
+
+SYSTEM_INFO_TOOL = SystemInfoTool()
 
 
 def get_system_info() -> ToolResult:
-    """Return the fixed placeholder system-information result."""
-    return ToolResult(
-        tool_name=TOOL_NAME,
-        status="success",
-        payload=dict(PLACEHOLDER_PAYLOAD),
-        error=None,
-    )
+    """Compatibility function for callers of the Phase 1 stub."""
+    return SYSTEM_INFO_TOOL.invoke()
 
 
-if not tool_registry.exists(TOOL_NAME):
-    tool_registry.register(TOOL_DEFINITION)
+TOOL_DEFINITION = SYSTEM_INFO_TOOL.definition

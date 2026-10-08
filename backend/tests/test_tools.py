@@ -1,4 +1,4 @@
-"""Tests for tool contracts, registry, and the system-info stub."""
+"""Tests for tool contracts, registry, and bounded system information."""
 
 import pytest
 import pytest_asyncio
@@ -116,25 +116,37 @@ def test_registry_duplicate_registration_rejected():
         registry.register(_definition("dup_tool"))
 
 
-# System-info stub tests
+# System-info tool tests
 
 
-def test_system_info_stub_deterministic():
-    """Stub returns identical fixed payloads on every call."""
-    first = get_system_info()
-    second = get_system_info()
-    assert first.status == "success"
-    assert first.error is None
-    assert first.payload == second.payload == {
-        "os": "Windows",
-        "platform": "placeholder",
-        "hostname": "placeholder",
-        "architecture": "x64",
+def test_system_info_returns_bounded_structure():
+    """System info returns the documented non-sensitive fields."""
+    result = get_system_info()
+    assert result.status == "success"
+    assert result.success is True
+    assert result.error is None
+    assert set(result.payload or {}) == {
+        "operating_system",
+        "os_version",
+        "hostname",
+        "cpu",
+        "cpu_count",
+        "ram",
+        "python_version",
     }
 
 
+def test_system_info_does_not_expose_environment_data(monkeypatch):
+    """The tool does not return environment variables or secrets."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-secret-that-must-not-appear")
+    result = get_system_info()
+    assert result.status == "success"
+    assert "test-secret-that-must-not-appear" not in str(result.model_dump())
+    assert "environment" not in (result.payload or {})
+
+
 def test_system_info_registered_read_only():
-    """Stub tool is registered globally as read-only, no approval."""
+    """System-info is registered globally as read-only, no approval."""
     definition = tool_registry.get(TOOL_NAME)
     assert definition is not None
     assert definition.read_only is True
@@ -149,11 +161,14 @@ async def test_system_info_endpoint_schema(client: AsyncClient):
     data = response.json()
     assert data["tool_name"] == "get_system_info"
     assert data["status"] == "success"
-    assert data["payload"] == {
-        "os": "Windows",
-        "platform": "placeholder",
-        "hostname": "placeholder",
-        "architecture": "x64",
+    assert set(data["payload"]) == {
+        "operating_system",
+        "os_version",
+        "hostname",
+        "cpu",
+        "cpu_count",
+        "ram",
+        "python_version",
     }
     assert data["timestamp"]
 
