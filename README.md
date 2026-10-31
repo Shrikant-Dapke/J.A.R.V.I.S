@@ -68,6 +68,13 @@ Authorization: Bearer <JARVIS_API_TOKEN>
 X-JARVIS-Session: <random-per-process-session-id>
 ```
 
+Native clients may alternatively pass the token as `X-JARVIS-Token`
+(Swagger UI exposes both fields plus the session header); if both token
+headers are present they must match. Until `JARVIS_API_TOKEN` is
+configured on the server, protected requests fail closed with a safe
+`503 API authentication is not configured.` response — supplied client
+tokens cannot bypass that.
+
 The token authenticates the local API client and the session binds approvals
 and conversations to that client session. It is not evidence of informed user consent. A future
 desktop approval experience must present the exact action and obtain the
@@ -79,6 +86,95 @@ Run tests:
 ```bash
 pytest tests/ -v
 ```
+
+## LLM Providers
+
+Three interchangeable providers live behind `backend/app/services/llm/`. The chat
+service contract is unchanged: providers receive the conversation history and
+return plain assistant text only — **the model never executes tools and its
+output is treated as untrusted** (policy and the approval workflow stay in
+control).
+
+| Provider | Purpose | Requires |
+|----------|---------|----------|
+| `fake`   | Deterministic offline default, no network | nothing |
+| `gemini` | Cloud generation via the Google Gemini API | `GEMINI_API_KEY` |
+| `ollama` | Local generation via Qwen 3.5 4B on Ollama | local Ollama runtime |
+
+Switch by setting `LLM_PROVIDER` in `backend/.env` (`fake`, `gemini`, or
+`ollama`) and restarting the backend. The selected client is cached and reused
+across requests; the test override (`set_llm_provider_override`) keeps taking
+precedence.
+
+### Ollama (local Qwen 3.5)
+
+Phase 1 target: local **Qwen 3.5 4B at Q4_K_M** (`qwen3.5:4b-q4_K_M`,
+~3.3 GB) through the Ollama runtime (`http://127.0.0.1:11434`), text
+generation only, non-streaming. The 9B model is intentionally out of
+scope for this phase.
+
+1. **Install Ollama** (Windows): `winget install Ollama.Ollama` or download from
+   [ollama.com/download](https://ollama.com/download). The service then listens
+   on the loopback address `http://127.0.0.1:11434`.
+
+2. **Download and run the model** (the only model documented for this phase):
+
+   ```powershell
+   ollama pull qwen3.5:4b-q4_K_M
+   ollama run qwen3.5:4b-q4_K_M
+   ```
+
+   Verify with `ollama list`. Type `/bye` to exit the interactive run.
+
+3. **Configure `backend/.env`** (copy from `.env.example` first):
+
+   ```text
+   LLM_PROVIDER=ollama
+   OLLAMA_BASE_URL=http://127.0.0.1:11434
+   OLLAMA_MODEL=qwen3.5:4b-q4_K_M
+   OLLAMA_TIMEOUT_SECONDS=120
+   OLLAMA_NUM_CTX=4096
+   ```
+
+4. **Start the backend** (see *Backend Setup* above) and chat via
+   `POST /api/chat`. If Ollama is unavailable the API returns a safe structured
+   error instead of failing silently.
+
+**Switching providers:** set `LLM_PROVIDER` to `fake` for the
+deterministic offline default (no Ollama needed) or `gemini` for the
+cloud provider (requires `GEMINI_API_KEY`), then restart the backend;
+the extra Ollama variables can stay in place — they are only used when
+`ollama` is selected.
+
+Configuration is validated at startup:
+
+- `OLLAMA_BASE_URL` must be a **loopback http(s) endpoint** — the backend
+  rejects remote hosts so prompts can never be silently sent off the machine.
+- `OLLAMA_TIMEOUT_SECONDS` is bounded (1.0–600.0), `OLLAMA_NUM_CTX` is bounded
+  (256–32768).
+
+**Thinking-mode safety:** Qwen 3.5 is a thinking-capable model. The
+backend requests thinking off and additionally strips Ollama's
+reasoning shapes (the separate `thinking` field and legacy inline
+thinking markers) so only the final assistant text is ever returned.
+An answer with no visible text after stripping becomes a structured
+error, never internal reasoning.
+
+**Hardware note (RTX 3050 6GB / 16GB RAM):** the 4B Q4_K_M weights
+(~3.3 GB) are expected to fit largely in the 6 GB VRAM at a 4096-token
+context, with CPU hybrid offload as the automatic fallback. Pose
+latency/memory is **not yet benchmarked**, so the 4096 ctx is a starting
+point, not a proven optimum.
+
+#### Troubleshooting Ollama
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `502 Language model service is unavailable` | Ollama not running | Start the Ollama desktop app, or run `ollama serve`; check `http://127.0.0.1:11434` |
+| `ollama pull` fails | network or name typo | Confirm the exact tag with `ollama pull qwen3.5:4b-q4_K_M` and retry |
+| Model not found at chat time | pull incomplete | `ollama list` must show `qwen3.5:4b-q4_K_M` before selecting `LLM_PROVIDER=ollama` |
+| `504 Language model request timed out` | first load / cold model | Keep `ollama run qwen3.5:4b-q4_K_M` warm or raise `OLLAMA_TIMEOUT_SECONDS` (max 600) |
+| Slow responses | low VRAM, CPU offload | Lower `OLLAMA_NUM_CTX` (e.g. 2048) and retest; keep the backend on loopback |
 
 ## Status
 **Phase 0 — Foundation**

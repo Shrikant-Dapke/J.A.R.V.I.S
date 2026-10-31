@@ -1,11 +1,57 @@
 """Application configuration using Pydantic Settings."""
 
 import ipaddress
+import re
 from pathlib import PureWindowsPath
 from typing import Optional
+from urllib.parse import urlparse
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Ollama local provider bounds (shared with the provider implementation).
+OLLAMA_MODEL_NAME_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}(?::[A-Za-z0-9._-]{1,120})?$"
+)
+OLLAMA_TIMEOUT_BOUNDS = (1.0, 600.0)
+OLLAMA_NUM_CTX_BOUNDS = (256, 32768)
+
+
+def validate_loopback_http_url(url: str) -> str:
+    """
+    Require an http(s) base URL that can only ever target the loopback
+    interface (127.0.0.0/8, ::1, or localhost).
+
+    Used for the local model runtime so prompts cannot be silently
+    redirected to arbitrary remote hosts.
+    """
+    value = (url or "").strip()
+    if not value:
+        raise ValueError("expected a non-empty http(s) URL")
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("expected the http or https scheme")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("must not embed credentials")
+    if parsed.query or parsed.fragment:
+        raise ValueError("must not contain a query or fragment")
+    if parsed.path not in ("", "/"):
+        raise ValueError("must be a bare base URL without a path")
+    host = parsed.hostname or ""
+    is_loopback = False
+    if host == "localhost":
+        is_loopback = True
+    else:
+        try:
+            is_loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = False
+    if not is_loopback:
+        raise ValueError(
+            "must target the loopback interface "
+            "(e.g. http://127.0.0.1:11434)"
+        )
+    return value
 
 
 class Settings(BaseSettings):
@@ -50,13 +96,36 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", description="Logging level")
     log_format: str = Field(default="json", description="Log format (json or text)")
 
-    # LLM provider (fake = deterministic offline default, gemini = live API)
+    # LLM provider (fake = deterministic offline default, gemini = live API,
+    # ollama = local model via the loopback Ollama runtime)
     llm_provider: str = Field(default="fake", description="LLM provider name")
     gemini_model: str = Field(
         default="gemini-2.0-flash", description="Gemini model identifier"
     )
     gemini_api_key: Optional[str] = Field(
         default=None, description="Gemini API key (never logged)"
+    )
+
+    # Ollama local provider (Phase 1 — text generation only). The base URL
+    # is restricted to the loopback interface so prompts never leave the
+    # machine unknowingly, and no secrets are involved.
+    ollama_base_url: str = Field(
+        default="http://127.0.0.1:11434",
+        description="Loopback base URL of the local Ollama runtime",
+    )
+    ollama_model: str = Field(
+        default="qwen3.5:4b-q4_K_M",
+        description=(
+            "Ollama chat model identifier (Phase 1: qwen3.5:4b-q4_K_M)"
+        ),
+    )
+    ollama_timeout_seconds: float = Field(
+        default=120.0,
+        description="Bounded Ollama request timeout in seconds",
+    )
+    ollama_num_ctx: int = Field(
+        default=4096,
+        description="Ollama context window size in tokens",
     )
 
     @field_validator("app_env")
@@ -135,11 +204,55 @@ class Settings(BaseSettings):
     @classmethod
     def validate_llm_provider(cls, v: str) -> str:
         """Validate LLM provider name."""
-        allowed = {"fake", "gemini"}
+        allowed = {"fake", "gemini", "ollama"}
         v_lower = v.lower()
         if v_lower not in allowed:
             raise ValueError(f"llm_provider must be one of {allowed}, got '{v}'")
         return v_lower
+
+    @field_validator("ollama_base_url")
+    @classmethod
+    def validate_ollama_base_url(cls, v: str) -> str:
+        """Restrict the Ollama runtime to a loopback HTTP endpoint."""
+        try:
+            return validate_loopback_http_url(v)
+        except ValueError as exc:
+            raise ValueError(f"ollama_base_url {exc}") from exc
+
+    @field_validator("ollama_model")
+    @classmethod
+    def validate_ollama_model(cls, v: str) -> str:
+        """Validate the Ollama model identifier format."""
+        value = (v or "").strip()
+        if not OLLAMA_MODEL_NAME_RE.match(value):
+            raise ValueError(
+                "ollama_model must be a valid model identifier "
+                "(e.g. qwen3.5:9b)"
+            )
+        return value
+
+    @field_validator("ollama_timeout_seconds")
+    @classmethod
+    def validate_ollama_timeout_seconds(cls, v: float) -> float:
+        """Accept only bounded request timeouts."""
+        low, high = OLLAMA_TIMEOUT_BOUNDS
+        timeout = float(v)
+        if not low <= timeout <= high:
+            raise ValueError(
+                f"ollama_timeout_seconds must be between {low} and {high}"
+            )
+        return timeout
+
+    @field_validator("ollama_num_ctx")
+    @classmethod
+    def validate_ollama_num_ctx(cls, v: int) -> int:
+        """Accept only bounded context window sizes."""
+        low, high = OLLAMA_NUM_CTX_BOUNDS
+        if not low <= v <= high:
+            raise ValueError(
+                f"ollama_num_ctx must be between {low} and {high}"
+            )
+        return v
 
 
 settings = Settings()

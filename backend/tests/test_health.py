@@ -322,3 +322,43 @@ def test_config_rejects_relative_code_executable_path():
     """Optional executable overrides cannot re-enable PATH lookup."""
     with pytest.raises(ValueError, match="absolute path"):
         Settings(code_executable_path="Code.exe")
+
+
+# Server token configuration failure tests
+
+
+def test_config_empty_api_token_env_is_unconfigured(monkeypatch):
+    """An empty or whitespace JARVIS_API_TOKEN setting means 'off' (503),
+    never an all-zero-trust token."""
+    monkeypatch.setenv("JARVIS_API_TOKEN", "")
+    assert Settings().api_token is None
+    monkeypatch.setenv("JARVIS_API_TOKEN", "   ")
+    assert Settings().api_token is None
+
+
+def test_config_short_api_token_rejected_at_startup():
+    """Trivial passwords cannot enable authentication (fails closed)."""
+    # Keyed by the env var name: the init source outranks any local .env.
+    with pytest.raises(ValueError, match="at least 32"):
+        Settings(**{"JARVIS_API_TOKEN": "short-token"})
+
+
+def test_unconfigured_server_token_returns_503():
+    """Missing server-side token yields a safe 503, not an auth bypass."""
+    from app.core.security import require_authenticated_session
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+
+    from app.core.config import settings
+
+    previous = settings.api_token
+    settings.api_token = None
+    try:
+        with pytest.raises(StarletteHTTPException) as exc_info:
+            require_authenticated_session(
+                authorization=None, header_token=None, session_id=None
+            )
+    finally:
+        settings.api_token = previous
+    response = exc_info.value
+    assert response.status_code == 503
+    assert response.detail == "API authentication is not configured."

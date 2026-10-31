@@ -1,13 +1,20 @@
-"""Tests for the LLM provider abstraction (fake only, never the real API)."""
+"""Tests for the LLM provider abstraction (mocked, never the real APIs).
 
+All provider HTTP calls are mocked (Gemini fake client object,
+Ollama httpx.MockTransport); tests never require Ollama or Gemini to
+be installed or reachable.
+"""
+
+import json
 import uuid
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 
-from app.core.config import Settings
+from app.core.config import Settings, settings
 from app.main import app
 from app.schemas.llm import LLMMessage, LLMResponse
 from app.services.chat_service import get_chat_response
@@ -29,6 +36,7 @@ from app.services.llm.factory import (
 )
 from app.services.llm.fake import PLACEHOLDER_RESPONSE, FakeProvider
 from app.services.llm.gemini import GeminiProvider
+from app.services.llm.ollama import OllamaProvider
 
 SERVICE_OWNER_ID = "hash-of-test-owner"
 SERVICE_SESSION_ID = "llm-test-session-0123456789"
@@ -362,3 +370,483 @@ def test_llm_provider_invalid_rejected():
     with pytest.raises(ValueError) as exc_info:
         Settings(llm_provider="openai")
     assert "llm_provider must be one of" in str(exc_info.value)
+
+
+# Ollama provider unit tests (mocked transport, no network)
+
+
+OLLAMA_REPLY = {
+    "model": "qwen3.5:4b-q4_K_M",
+    "created_at": "2026-01-01T00:00:00.000000000Z",
+    "message": {"role": "assistant", "content": "local reply"},
+    "done": True,
+}
+
+
+def _ollama_provider(handler, **overrides):
+    """Build an OllamaProvider whose HTTP layer is a MockTransport."""
+    return OllamaProvider(
+        base_url="http://127.0.0.1:11434",
+        model="qwen3.5:4b-q4_K_M",
+        timeout_seconds=5.0,
+        num_ctx=2048,
+        transport=httpx.MockTransport(handler),
+        **overrides,
+    )
+
+
+def test_ollama_provider_implements_interface():
+    """OllamaProvider satisfies the LLMProvider contract."""
+    provider = _ollama_provider(
+        lambda request: httpx.Response(200, json=OLLAMA_REPLY, request=request)
+    )
+    assert isinstance(provider, LLMProvider)
+    result = provider.generate_response(
+        [LLMMessage(role="user", content="Hi")]
+    )
+    assert result.content == "local reply"
+
+
+def test_ollama_success_returns_content_and_model_metadata():
+    """Content is parsed from message.content, model from response."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=OLLAMA_REPLY, request=request)
+
+    result = _ollama_provider(handler).generate_response(
+        [LLMMessage(role="user", content="Hi")]
+    )
+    assert result.content == "local reply"
+    assert result.model == "qwen3.5:4b-q4_K_M"
+
+
+# Thinking-mode tests (Qwen 3.5 is thinking-capable; internal reasoning
+# must never reach the caller in any of Ollama's response shapes).
+
+
+_O = "<" + "think" + ">"  # thinking marker, assembled to avoid confusion
+_C = "<" + "/" + "think" + ">"
+
+
+def test_ollama_separate_thinking_field_is_not_returned():
+    """A message.thinking field is ignored; only content is returned."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {
+            "role": "assistant",
+            "content": "final answer",
+            "thinking": "internal reasoning seed-internal-token",
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    result = _ollama_provider(handler).generate_response(
+        [LLMMessage(role="user", content="Hi")]
+    )
+    assert result.content == "final answer"
+    assert "internal reasoning" not in result.content
+    assert "seed-internal-token" not in result.content
+
+
+def test_ollama_thinking_only_response_is_invalid():
+    """Empty content with only internal reasoning is a safe error."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {
+            "role": "assistant",
+            "content": "",
+            "thinking": "all reasoning, no answer",
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_think_markers_are_stripped():
+    """Legacy inline thinking blocks never surface as the answer."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {
+            "role": "assistant",
+            "content": _O
+            + "hidden reasoning trace"
+            + _C
+            + "the visible answer",
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    result = _ollama_provider(handler).generate_response(
+        [LLMMessage(role="user", content="Hi")]
+    )
+    assert result.content == "the visible answer"
+    assert "hidden reasoning" not in result.content
+
+
+def test_ollama_whitespace_only_after_marker_stripping_is_invalid():
+    """Content that is hollow after marker removal raises invalid."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {
+            "role": "assistant",
+            "content": "   " + _O + "reasoning" + _C + "   ",
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_unclosed_think_marker_drops_reasoning_tail():
+    """Truncated generation: unclosed marker strips to end of content."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {
+            "role": "assistant",
+            "content": _O + "leaky truncated reasoning",
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_plain_content_without_thinking_is_untouched():
+    """Responses with no reasoning shapes pass through exactly."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {"role": "assistant", "content": "plain text"}
+        return httpx.Response(200, json=body, request=request)
+
+    assert (
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        ).content
+        == "plain text"
+    )
+
+
+def test_ollama_falls_back_to_configured_model_metadata():
+    """A missing upstream model field falls back to the configured name."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body.pop("model")
+        return httpx.Response(200, json=body, request=request)
+
+    result = _ollama_provider(handler).generate_response(
+        [LLMMessage(role="user", content="Hi")]
+    )
+    assert result.model == "qwen3.5:4b-q4_K_M"
+
+
+def test_ollama_sends_expected_payload_and_maps_history():
+    """POST /api/chat with stream off, num_ctx, and 1:1 role mapping."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(200, json=OLLAMA_REPLY, request=request)
+
+    provider = _ollama_provider(handler)
+    result = provider.generate_response(
+        [
+            LLMMessage(role="user", content="Hi"),
+            LLMMessage(role="assistant", content="Hello"),
+            LLMMessage(role="user", content="What can you do?"),
+        ]
+    )
+    assert result.content == "local reply"
+    assert captured["url"] == "http://127.0.0.1:11434/api/chat"
+    assert captured["payload"] == {
+        "model": "qwen3.5:4b-q4_K_M",
+        "messages": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "What can you do?"},
+        ],
+        "stream": False,
+        "think": False,
+        "options": {"num_ctx": 2048},
+    }
+
+
+def test_ollama_empty_content_is_invalid():
+    """Whitespace-only model output raises an invalid-response error."""
+    for content in ("", "   "):
+
+        def handler(request: httpx.Request, _c=content) -> httpx.Response:
+            body = dict(OLLAMA_REPLY)
+            body["message"] = {"role": "assistant", "content": _c}
+            return httpx.Response(200, json=body, request=request)
+
+        with pytest.raises(LLMInvalidResponseError):
+            _ollama_provider(handler).generate_response(
+                [LLMMessage(role="user", content="Hi")]
+            )
+
+
+def test_ollama_missing_message_is_invalid():
+    """A body without a message object raises invalid-response."""
+    body = {k: v for k, v in OLLAMA_REPLY.items() if k != "message"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body, request=request)
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_error_body_is_invalid():
+    """An error body (HTTP 200) is not turned into assistant text."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"error": "unknown model"}, request=request
+        )
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_non_string_content_is_invalid():
+    """Non-string message content raises invalid-response."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {"role": "assistant", "content": 12345}
+        return httpx.Response(200, json=body, request=request)
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_non_dict_body_is_invalid():
+    """A JSON array body raises invalid-response."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[OLLAMA_REPLY], request=request)
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_malformed_json_is_invalid():
+    """Truncated/invalid JSON raises invalid-response."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=b'{"message": {"content": "hi"', request=request
+        )
+
+    with pytest.raises(LLMInvalidResponseError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_connection_refused_maps_to_provider_error():
+    """Unreachable service maps to a provider error."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(LLMProviderError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+def test_ollama_timeout_maps_to_timeout_error():
+    """Timeouts map to timeout errors."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    with pytest.raises(LLMTimeoutError):
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 500, 503])
+def test_ollama_http_error_maps_to_provider_error(status_code):
+    """HTTP error statuses map to provider errors without leaking."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status_code,
+            json={"error": "leaky-internal-trace-value"},
+            request=request,
+        )
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        _ollama_provider(handler).generate_response(
+            [LLMMessage(role="user", content="Hi")]
+        )
+    assert "leaky-internal-trace-value" not in str(exc_info.value)
+
+
+def test_ollama_provider_rejects_non_loopback_base_url():
+    """The provider refuses URLs that could leave the machine."""
+    with pytest.raises(LLMConfigurationError):
+        OllamaProvider(base_url="http://203.0.113.5:11434")
+    with pytest.raises(LLMConfigurationError):
+        OllamaProvider(base_url="ftp://127.0.0.1:11434")
+
+
+def test_ollama_provider_rejects_invalid_model_and_bounds():
+    """Model name, timeout, and context constructor validation."""
+    with pytest.raises(LLMConfigurationError):
+        OllamaProvider(model="bad model name!")
+    with pytest.raises(LLMConfigurationError):
+        OllamaProvider(timeout_seconds=0.5)
+    with pytest.raises(LLMConfigurationError):
+        OllamaProvider(timeout_seconds=601.0)
+    with pytest.raises(LLMConfigurationError):
+        OllamaProvider(num_ctx=100)
+    with pytest.raises(LLMConfigurationError):
+        OllamaProvider(num_ctx=100_000)
+
+
+# Factory selection with Ollama configured (no network: client is not used)
+
+
+def test_factory_selects_ollama(monkeypatch):
+    """llm_provider=ollama selects and caches the Ollama provider."""
+    clear_llm_provider_cache()
+    set_llm_provider_override(None)
+    monkeypatch.setattr(settings, "llm_provider", "ollama")
+    try:
+        provider = get_llm_provider()
+        assert isinstance(provider, OllamaProvider)
+        assert provider.model == "qwen3.5:4b-q4_K_M"
+        assert get_llm_provider() is provider  # cached client reused
+    finally:
+        set_llm_provider_override(FakeProvider())
+        clear_llm_provider_cache()
+
+
+def test_provider_override_beats_ollama_configuration(monkeypatch):
+    """Explicit overrides still win over settings configuration."""
+    override = FakeProvider()
+    set_llm_provider_override(override)
+    monkeypatch.setattr(settings, "llm_provider", "ollama")
+    try:
+        assert get_llm_provider() is override
+    finally:
+        set_llm_provider_override(FakeProvider())
+        clear_llm_provider_cache()
+
+
+@pytest.mark.asyncio
+async def test_chat_route_with_mocked_ollama_provider(
+    client: AsyncClient, provider_override
+):
+    """End-to-end chat with a mocked Ollama provider (no network).
+
+    The mocked response carries internal reasoning in both shapes
+    (separate thinking field plus inline markers); none may reach the
+    user-facing response.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = dict(OLLAMA_REPLY)
+        body["message"] = {
+            "role": "assistant",
+            "content": _O + "hidden router reasoning" + _C + "route reply",
+            "thinking": "separate-field router reasoning seed-route",
+        }
+        return httpx.Response(200, json=body, request=request)
+
+    set_llm_provider_override(_ollama_provider(handler))
+    response = await client.post("/api/chat", json={"message": "Hello"})
+    assert response.status_code == 200
+    assert response.json()["response"] == "route reply"
+    assert "hidden router reasoning" not in response.text
+    assert "seed-route" not in response.text
+
+
+# Ollama settings validation
+
+
+def test_ollama_settings_defaults_target_phase1_model():
+    """Phase 1 Ollama defaults: qwen3.5:4b-q4_K_M, 120s bounded timeout,
+    4096-token context on the loopback runtime.
+
+    llm_provider's default is asserted by the offline-default factory
+    test (Settings reflects the local .env otherwise).
+    """
+    assert Settings().ollama_model == "qwen3.5:4b-q4_K_M"
+    assert Settings().ollama_timeout_seconds == 120.0
+    assert Settings().ollama_num_ctx == 4096
+    assert Settings().ollama_base_url == "http://127.0.0.1:11434"
+
+
+def test_llm_provider_accepts_ollama():
+    """ollama is a permitted provider name (case-insensitive)."""
+    assert Settings(llm_provider="OLLAMA").llm_provider == "ollama"
+
+
+def test_ollama_settings_accept_loopback_urls():
+    """Loopback literals and localhost are accepted."""
+    assert (
+        Settings(ollama_base_url="http://127.0.0.1:11434").ollama_base_url
+        == "http://127.0.0.1:11434"
+    )
+    assert (
+        Settings(ollama_base_url="http://localhost:11434").ollama_base_url
+        == "http://localhost:11434"
+    )
+    assert (
+        Settings(ollama_base_url="http://[::1]:11434").ollama_base_url
+        == "http://[::1]:11434"
+    )
+
+
+def test_ollama_settings_reject_remote_hosts():
+    """Non-loopback endpoints are rejected at configuration time."""
+    with pytest.raises(ValueError) as loopback_info:
+        Settings(ollama_base_url="http://198.51.100.5:11434")
+    assert "ollama_base_url" in str(loopback_info.value)
+    with pytest.raises(ValueError):
+        Settings(ollama_base_url="http://example.com:11434")
+    with pytest.raises(ValueError):
+        Settings(ollama_base_url="ftp://127.0.0.1:11434")
+    with pytest.raises(ValueError):
+        Settings(ollama_base_url="http://user:pass@127.0.0.1:11434")
+    with pytest.raises(ValueError):
+        Settings(ollama_base_url="http://127.0.0.1:11434/api")
+
+
+def test_ollama_settings_reject_bad_model_and_bounds():
+    """Model identifier and numeric bounds are validated."""
+    with pytest.raises(ValueError):
+        Settings(ollama_model="")
+    with pytest.raises(ValueError):
+        Settings(ollama_model="bad model name!")
+    with pytest.raises(ValueError):
+        Settings(ollama_timeout_seconds=0.1)
+    with pytest.raises(ValueError):
+        Settings(ollama_num_ctx=100)
+    assert Settings(ollama_num_ctx=2048).ollama_num_ctx == 2048

@@ -7,8 +7,8 @@
 - Tailwind CSS
 - Python + FastAPI backend
 - SQLite persistence
-- Configurable cloud model adapter
-- Optional Ollama local adapter, subject to compatibility/performance testing
+- Configurable cloud model adapter (Gemini provider implemented)
+- Ollama local adapter (Phase 1: Qwen 3.5 4B Q4_K_M, text generation only)
 
 Versions and provider choices are pinned during implementation planning.
 
@@ -17,6 +17,14 @@ Versions and provider choices are pinned during implementation planning.
 2. **Local API:** communication between UI and backend.
 3. **Orchestrator:** intent handling, model calls, tool-call parsing, task state.
 4. **Model Router:** chooses configured cloud/local provider by policy and availability.
+   Implemented as the provider factory (`backend/app/services/llm/factory.py`)
+   with `fake` (offline default), `gemini` (cloud), and `ollama` (local Qwen 3.5
+   4B via the loopback Ollama runtime) behind one `LLMProvider` text-in/text-out
+   interface. Clients with pooled connections are cached; settings-driven
+   selection stays test-overridable. The Ollama base URL is validated as a
+   loopback http(s) endpoint, request timeouts are bounded, failures map to
+   shared structured LLM errors, and thinking-capable model output is stripped
+   of internal reasoning before it can reach any response path.
 5. **Tool Registry:** maps tool IDs to typed implementations.
 6. **Policy/Approval Manager:** checks permissions and binds approval to exact arguments.
 7. **Execution Layer:** invokes narrow tools with bounded privileges.
@@ -94,7 +102,10 @@ JARVIS/
 ```
 
 ## 8. Failure handling
-- Model unavailable: show provider error; do not fabricate.
+- Model unavailable: show provider error; do not fabricate. This includes the
+  local Ollama runtime being stopped or unreachable: the provider maps the
+  failure to a safe structured error (connection/HTTP → 502, timeout → 504)
+  and never falls back silently to another provider.
 - Validation failure: reject before execution.
 - Approval denied/expired: do not execute.
 - Tool exception: record failure and return safe message.
