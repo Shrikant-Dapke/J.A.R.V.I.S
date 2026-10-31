@@ -15,10 +15,14 @@ from app.services.tool_registry import ToolRegistry, tool_registry
 
 
 @pytest_asyncio.fixture
-async def client():
+async def client(api_headers):
     """Create an async test client."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as ac:
         yield ac
 
 

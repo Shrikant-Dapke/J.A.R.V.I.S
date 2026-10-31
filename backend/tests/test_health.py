@@ -1,5 +1,7 @@
 """Tests for the health endpoint and API foundation."""
 
+import logging
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -12,7 +14,9 @@ from app.core.config import Settings
 async def client():
     """Create an async test client."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport, base_url="http://127.0.0.1"
+    ) as ac:
         yield ac
 
 
@@ -24,6 +28,18 @@ async def test_health_endpoint_returns_200(client: AsyncClient):
     """Test that the health endpoint returns HTTP 200."""
     response = await client.get("/api/health")
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_non_loopback_asgi_server_fails_closed():
+    """Requests are rejected when the reported server bind is non-loopback."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://0.0.0.0"
+    ) as client:
+        response = await client.get("/api/health")
+
+    assert response.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -152,16 +168,103 @@ async def test_404_returns_structured_error(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_validation_error_returns_structured_error(client: AsyncClient):
+async def test_validation_error_returns_structured_error(api_headers):
     """Test that validator-based 422s return structured JSON responses."""
     # Triggers a Pydantic field_validator ValueError (covers the
     # _sanitize_for_json path for non-serializable ctx values).
-    response = await client.post("/api/chat", json={"message": "   "})
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as authenticated:
+        response = await authenticated.post("/api/chat", json={"message": "   "})
     assert response.status_code == 422
     data = response.json()
     assert data["error"]["code"] == "VALIDATION_ERROR"
     assert "request_id" in data["error"]
     assert "errors" in data["error"]["details"]
+
+
+# Unhandled exception containment tests
+
+
+@pytest.mark.asyncio
+async def test_unhandled_exception_returns_generic_error_with_request_id(
+    api_headers, monkeypatch
+):
+    """Internal failures never leak details and keep the correlation ID."""
+    import app.api.chat as chat_api
+
+    def broken_response(*args, **kwargs):
+        raise RuntimeError("internal database password leaked")
+
+    monkeypatch.setattr(chat_api, "get_chat_response", broken_response)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as authenticated:
+        response = await authenticated.post("/api/chat", json={"message": "Hi"})
+
+    assert response.status_code == 500
+    data = response.json()
+    assert data["error"]["code"] == "INTERNAL_ERROR"
+    assert data["error"]["message"] == "An unexpected error occurred"
+    assert "request_id" in data["error"]
+    body = response.text
+    assert "RuntimeError" not in body
+    assert "internal database password leaked" not in body
+
+
+@pytest.mark.asyncio
+async def test_request_logging_middleware_preserves_exception(
+    api_headers, monkeypatch, caplog
+):
+    """The logging middleware binds, logs, and re-raises the original error."""
+    import app.api.chat as chat_api
+
+    def broken_response(*args, **kwargs):
+        raise RuntimeError("database password leaked")
+
+    monkeypatch.setattr(chat_api, "get_chat_response", broken_response)
+
+    with caplog.at_level(logging.ERROR):
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://127.0.0.1",
+            headers=api_headers,
+        ) as authenticated:
+            response = await authenticated.post(
+                "/api/chat", json={"message": "Hi"}
+            )
+
+    assert response.status_code == 500
+
+    failures = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.ERROR and record.getMessage() == "HTTP request failed"
+    ]
+    assert failures, "request logging middleware did not log the failed request"
+    failure = failures[-1]
+    failure_fields = failure.__dict__.get("extra_fields") or {}
+    assert failure_fields.get("error_type") == "RuntimeError"
+    assert failure_fields.get("path") == "/api/chat"
+    assert failure.exc_info is not None
+    assert failure.exc_info[0] is RuntimeError
+
+    unhandled = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Unhandled exception"
+    ]
+    assert unhandled, "unhandled exception handler did not log the failure"
+    unhandled_fields = unhandled[-1].__dict__.get("extra_fields") or {}
+    assert unhandled_fields.get("error_type") == "RuntimeError"
 
 
 # Configuration validation tests
@@ -207,3 +310,15 @@ def test_config_invalid_log_format():
     with pytest.raises(ValueError) as exc_info:
         Settings(log_format="xml")
     assert "log_format must be one of" in str(exc_info.value)
+
+
+def test_config_rejects_non_loopback_host():
+    """Unsafe server binding configuration fails closed at startup."""
+    with pytest.raises(ValueError, match="loopback"):
+        Settings(host="0.0.0.0")
+
+
+def test_config_rejects_relative_code_executable_path():
+    """Optional executable overrides cannot re-enable PATH lookup."""
+    with pytest.raises(ValueError, match="absolute path"):
+        Settings(code_executable_path="Code.exe")

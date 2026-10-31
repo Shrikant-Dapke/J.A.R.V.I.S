@@ -41,7 +41,13 @@ Versions and provider choices are pinned during implementation planning.
 - Tools expose narrow operations, never a general shell.
 - Backend policy is authoritative; UI is not the only enforcement point.
 - Secrets stay outside source control and are redacted from logs.
-- Local API is restricted to loopback and protected against unintended cross-origin access.
+- Local API binding is restricted to literal loopback addresses.
+- Protected chat, conversation, tool, and approval routes require a
+  configured bearer token and an explicit client session identifier;
+  approval is still a user-facing action, not an assumption made from
+  authentication alone.
+- Browser state-changing requests require an exact configured Origin. Native
+  clients without an Origin remain supported.
 
 ## 5. Initial API
 - `POST /api/chat` — submit request; receive response or proposed action.
@@ -52,7 +58,11 @@ Versions and provider choices are pinned during implementation planning.
 - `DELETE /api/memory/{id}` — delete memory item.
 - `GET /api/health` — service health.
 
-Implement API authentication/origin protections before enabling mutating endpoints.
+Mutating endpoints require `JARVIS_API_TOKEN` and `X-JARVIS-Session`. Configure
+exact browser origins with `JARVIS_ALLOWED_ORIGINS`; do not expose the service
+on a non-loopback interface. The current approval and conversation stores are
+process-local and must be replaced with shared transactional storage before
+multi-worker or multi-instance deployment.
 
 ## 6. Tool interfaces
 - `get_system_info()` — bounded read-only result.

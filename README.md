@@ -48,10 +48,32 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env
-uvicorn app.main:app --reload
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
+Set `JARVIS_API_TOKEN` in `.env` to a random value of at least 32
+characters before calling protected routes.
+
 Health check: `GET http://127.0.0.1:8000/api/health`
+
+### Local API Security
+
+The backend is loopback-only. `HOST` must be a literal loopback address and
+the application rejects requests if its ASGI server reports a non-loopback
+bind. Set `JARVIS_API_TOKEN` to a high-entropy secret before using protected
+chat, conversation, tool, or approval routes:
+
+```text
+Authorization: Bearer <JARVIS_API_TOKEN>
+X-JARVIS-Session: <random-per-process-session-id>
+```
+
+The token authenticates the local API client and the session binds approvals
+and conversations to that client session. It is not evidence of informed user consent. A future
+desktop approval experience must present the exact action and obtain the
+user's decision before calling the approval endpoint. Browser clients must
+also use an exact origin listed in `JARVIS_ALLOWED_ORIGINS`; native clients
+may omit `Origin`.
 
 Run tests:
 ```bash

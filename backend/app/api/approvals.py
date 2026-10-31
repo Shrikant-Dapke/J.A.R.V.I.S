@@ -1,8 +1,13 @@
 """Approval lifecycle endpoints; routes contain no execution logic."""
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.security import (
+    AuthenticatedSession,
+    require_authenticated_session,
+    require_safe_origin,
+)
 from app.schemas.approval import ApprovalRequest
 from app.schemas.tool import ToolResult
 from app.services.approval_service import (
@@ -10,10 +15,7 @@ from app.services.approval_service import (
     ApprovalPolicyError,
     approval_service,
 )
-from app.services.approval_store import (
-    ApprovalNotFoundError,
-    ApprovalStateError,
-)
+from app.services.approval_store import ApprovalNotFoundError, ApprovalStateError
 
 
 router = APIRouter(prefix="/api/approvals", tags=["approvals"])
@@ -34,19 +36,30 @@ def _invalid_transition(exc: ApprovalStateError) -> StarletteHTTPException:
 
 
 @router.get("/{approval_id}", response_model=ApprovalRequest)
-async def get_approval(approval_id: str) -> ApprovalRequest:
+async def get_approval(
+    approval_id: str,
+    principal: AuthenticatedSession = Depends(require_authenticated_session),
+) -> ApprovalRequest:
     """Return the current state, applying lazy expiration."""
     try:
-        return approval_service.get_request(approval_id)
+        return approval_service.get_request(
+            approval_id, principal.owner_id, principal.session_id
+        )
     except ApprovalNotFoundError as exc:
         raise _not_found(exc)
 
 
 @router.post("/{approval_id}/approve", response_model=ToolResult)
-async def approve_approval(approval_id: str) -> ToolResult:
+async def approve_approval(
+    approval_id: str,
+    principal: AuthenticatedSession = Depends(require_authenticated_session),
+    _origin: None = Depends(require_safe_origin),
+) -> ToolResult:
     """Approve and consume one exact request before executing it."""
     try:
-        return approval_service.approve_request(approval_id)
+        return approval_service.approve_request(
+            approval_id, principal.owner_id, principal.session_id
+        )
     except ApprovalNotFoundError as exc:
         raise _not_found(exc)
     except ApprovalStateError as exc:
@@ -56,13 +69,17 @@ async def approve_approval(approval_id: str) -> ToolResult:
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),
         )
-
-
 @router.post("/{approval_id}/reject", response_model=ApprovalRequest)
-async def reject_approval(approval_id: str) -> ApprovalRequest:
+async def reject_approval(
+    approval_id: str,
+    principal: AuthenticatedSession = Depends(require_authenticated_session),
+    _origin: None = Depends(require_safe_origin),
+) -> ApprovalRequest:
     """Reject one pending request without invoking the executor."""
     try:
-        return approval_service.reject_request(approval_id)
+        return approval_service.reject_request(
+            approval_id, principal.owner_id, principal.session_id
+        )
     except ApprovalNotFoundError as exc:
         raise _not_found(exc)
     except ApprovalStateError as exc:

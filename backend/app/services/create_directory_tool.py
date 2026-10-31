@@ -49,20 +49,34 @@ class CreateDirectoryTool(Tool[CreateDirectoryInput]):
     def __init__(self, approved_root: Path | str = DEFAULT_APPROVED_ROOT) -> None:
         self.approved_root = Path(approved_root)
 
+    @staticmethod
+    def _is_link_like(path: Path) -> bool:
+        """Detect symlinks and Windows junctions without following them."""
+        if path.is_symlink():
+            return True
+        is_junction = getattr(path, "is_junction", None)
+        return bool(is_junction and is_junction())
+
     def _resolve_target(self, relative_path: str) -> tuple[Path, Path] | None:
-        """Resolve the root and target while preventing traversal/symlink escape."""
+        """Resolve one direct child while rejecting link-like filesystem state."""
         root = self.approved_root
-        if not root.exists() or not root.is_dir():
+        if (
+            not root.exists()
+            or not root.is_dir()
+            or self._is_link_like(root)
+        ):
             return None
 
-        root_resolved = root.resolve()
+        root_resolved = root.resolve(strict=True)
         candidate = root / relative_path
+        if self._is_link_like(candidate):
+            return None
         candidate_resolved = candidate.resolve(strict=False)
         try:
             candidate_resolved.relative_to(root_resolved)
         except ValueError:
             return None
-        return root_resolved, candidate_resolved
+        return root_resolved, candidate
 
     def execute(self, arguments: CreateDirectoryInput) -> ToolResult:
         relative_path = arguments.path.strip()
@@ -82,6 +96,16 @@ class CreateDirectoryTool(Tool[CreateDirectoryInput]):
                 message="The directory path must stay inside the approved root.",
             )
 
+        # Python's portable mkdir API cannot create nested paths with a
+        # no-follow guarantee. Restricting this tool to one child means a
+        # raced final symlink is rejected rather than traversed by parents=True.
+        if len(path_object.parts) != 1 or len(windows_path.parts) != 1:
+            return ToolResult.failure_result(
+                tool_name=self.name,
+                error_code="unsafe_path",
+                message="Only a direct child of the approved root may be created.",
+            )
+
         resolved = self._resolve_target(relative_path)
         if resolved is None:
             return ToolResult.failure_result(
@@ -91,7 +115,7 @@ class CreateDirectoryTool(Tool[CreateDirectoryInput]):
             )
 
         root_resolved, target = resolved
-        if target == root_resolved:
+        if target.resolve(strict=False) == root_resolved:
             return ToolResult.failure_result(
                 tool_name=self.name,
                 error_code="unsafe_path",
@@ -99,6 +123,12 @@ class CreateDirectoryTool(Tool[CreateDirectoryInput]):
             )
 
         if target.exists():
+            if self._is_link_like(target):
+                return ToolResult.failure_result(
+                    tool_name=self.name,
+                    error_code="unsafe_path",
+                    message="The directory path must stay inside the approved root.",
+                )
             if target.is_dir():
                 return ToolResult.already_exists_result(
                     tool_name=self.name,
@@ -112,8 +142,14 @@ class CreateDirectoryTool(Tool[CreateDirectoryInput]):
             )
 
         try:
-            target.mkdir(parents=True, exist_ok=False)
+            target.mkdir(parents=False, exist_ok=False)
         except FileExistsError:
+            if self._is_link_like(target):
+                return ToolResult.failure_result(
+                    tool_name=self.name,
+                    error_code="unsafe_path",
+                    message="The directory path must stay inside the approved root.",
+                )
             if target.is_dir():
                 return ToolResult.already_exists_result(
                     tool_name=self.name,
@@ -138,7 +174,22 @@ class CreateDirectoryTool(Tool[CreateDirectoryInput]):
                 message="The directory could not be created.",
             )
 
-        if not target.is_dir():
+        try:
+            verified_root = self.approved_root.resolve(strict=True)
+            verified_target = target.resolve(strict=True)
+        except OSError:
+            return ToolResult.failure_result(
+                tool_name=self.name,
+                error_code="verification_failed",
+                message="The directory could not be verified after creation.",
+            )
+
+        if (
+            verified_root != root_resolved
+            or self._is_link_like(target)
+            or not target.is_dir()
+            or verified_target.parent != verified_root
+        ):
             return ToolResult.failure_result(
                 tool_name=self.name,
                 error_code="verification_failed",

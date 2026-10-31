@@ -30,10 +30,14 @@ if not tool_registry.exists(APPROVAL_TOOL_NAME):
 
 
 @pytest_asyncio.fixture
-async def client():
+async def client(api_headers):
     """Create an async test client."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as ac:
         yield ac
 
 
@@ -156,10 +160,11 @@ async def test_invoke_invalid_request_422(client: AsyncClient):
     """Malformed arguments return structured 422."""
     response = await client.post(
         f"/api/tools/{TOOL_NAME}/invoke",
-        json={"arguments": "not-a-dict"},
+        json={"arguments": "secret-token-value"},
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert "secret-token-value" not in response.text
 
 
 @pytest.mark.asyncio

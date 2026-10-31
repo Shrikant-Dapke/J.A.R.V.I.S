@@ -11,6 +11,10 @@ from app.core.config import Settings
 from app.main import app
 from app.schemas.llm import LLMMessage, LLMResponse
 from app.services.chat_service import get_chat_response
+from app.services.conversation_store import (
+    ConversationNotFoundError,
+    conversation_store,
+)
 from app.services.llm.base import LLMProvider
 from app.services.llm.errors import (
     LLMConfigurationError,
@@ -26,6 +30,9 @@ from app.services.llm.factory import (
 from app.services.llm.fake import PLACEHOLDER_RESPONSE, FakeProvider
 from app.services.llm.gemini import GeminiProvider
 
+SERVICE_OWNER_ID = "hash-of-test-owner"
+SERVICE_SESSION_ID = "llm-test-session-0123456789"
+
 
 @pytest.fixture
 def provider_override():
@@ -38,10 +45,14 @@ def provider_override():
 
 
 @pytest_asyncio.fixture
-async def client():
-    """Create an async test client."""
+async def client(api_headers):
+    """Create an async test client for the authenticated local owner."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as ac:
         yield ac
 
 
@@ -93,7 +104,12 @@ def test_chat_service_uses_provider(provider_override):
     set_llm_provider_override(recorder)
     conv_id = str(uuid.uuid4())
 
-    response = get_chat_response("Hello", conv_id)
+    response = get_chat_response(
+        "Hello",
+        conv_id,
+        owner_id=SERVICE_OWNER_ID,
+        session_id=SERVICE_SESSION_ID,
+    )
 
     assert response.response == "recorded-reply"
     assert response.conversation_id == conv_id
@@ -106,8 +122,12 @@ def test_conversation_history_passed_to_provider(provider_override):
     set_llm_provider_override(recorder)
     conv_id = str(uuid.uuid4())
 
-    get_chat_response("First", conv_id)
-    get_chat_response("Second", conv_id)
+    get_chat_response(
+        "First", conv_id, owner_id=SERVICE_OWNER_ID, session_id=SERVICE_SESSION_ID
+    )
+    get_chat_response(
+        "Second", conv_id, owner_id=SERVICE_OWNER_ID, session_id=SERVICE_SESSION_ID
+    )
 
     assert len(recorder.seen) == 2
     first_call = [(m.role, m.content) for m in recorder.seen[0]]
@@ -120,11 +140,49 @@ def test_conversation_history_passed_to_provider(provider_override):
     ]
 
 
+def test_chat_service_never_appends_to_foreign_conversation(provider_override):
+    """A conversation of another identity raises instead of being reused."""
+    recorder = RecordingProvider()
+    set_llm_provider_override(recorder)
+    conv_id = str(uuid.uuid4())
+
+    get_chat_response(
+        "First", conv_id, owner_id=SERVICE_OWNER_ID, session_id=SERVICE_SESSION_ID
+    )
+    with pytest.raises(ConversationNotFoundError):
+        get_chat_response(
+            "Hijack",
+            conv_id,
+            owner_id="hash-of-other-owner",
+            session_id="llm-other-session-012345678",
+        )
+
+    # The second call must not have reached the provider or stored turns.
+    assert len(recorder.seen) == 1
+    history = conversation_store.get_history(
+        conv_id, owner_id=SERVICE_OWNER_ID, session_id=SERVICE_SESSION_ID
+    )
+    assert [t.content for t in history] == ["First", "recorded-reply"]
+    assert (
+        conversation_store.get_history(
+            conv_id,
+            owner_id="hash-of-other-owner",
+            session_id="llm-other-session-012345678",
+        )
+        is None
+    )
+
+
 def test_provider_failure_propagates_from_service(provider_override):
     """Service does not swallow provider errors."""
     set_llm_provider_override(FailingProvider(LLMProviderError("boom")))
     with pytest.raises(LLMProviderError):
-        get_chat_response("Hello", str(uuid.uuid4()))
+        get_chat_response(
+            "Hello",
+            str(uuid.uuid4()),
+            owner_id=SERVICE_OWNER_ID,
+            session_id=SERVICE_SESSION_ID,
+        )
 
 
 # Route error-mapping tests
@@ -137,10 +195,15 @@ async def test_chat_makes_no_network_calls(
     """POST /api/chat succeeds with all socket creation blocked."""
     import socket
 
-    def _blocked(*args, **kwargs):
-        raise AssertionError("network call attempted during test")
+    class _BlockedSocket(socket.socket):
+        """Any socket instantiation must fail the test immediately."""
 
-    monkeypatch.setattr(socket, "socket", _blocked)
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("network call attempted during test")
+
+    # Replace the class (not with a callable) so alive event-loop internals
+    # that check isinstance(..., socket.socket) stay functional on Windows.
+    monkeypatch.setattr(socket, "socket", _BlockedSocket)
     response = await client.post("/api/chat", json={"message": "Hello"})
     assert response.status_code == 200
     assert response.json()["response"] == PLACEHOLDER_RESPONSE

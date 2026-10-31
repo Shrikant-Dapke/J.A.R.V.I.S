@@ -30,7 +30,7 @@ A Windows desktop assistant with a local backend, configurable cloud/local model
 | FR-16 | Present visible bounded plans for supported multi-step tasks. | P1 |
 
 ## 4. Non-functional requirements
-- **Security:** no unrestricted shell; least-privilege tool interfaces; secrets excluded from source control and logs.
+- **Security:** no unrestricted shell; least-privilege tool interfaces; secrets excluded from source control and logs; local API authentication and loopback-only binding.
 - **Reliability:** failures/timeouts must not produce false success claims.
 - **Privacy:** local memory is user-controlled; cloud-bound content should be clear/configurable.
 - **Maintainability:** UI, orchestration, model adapters, tools, storage, and verification remain separate.
@@ -45,7 +45,7 @@ Read-only; return a bounded documented set of OS/device/resource fields. Avoid s
 Accept only a configured application ID. Never accept arbitrary model-supplied command-line strings. Verify launch using a process or application-specific signal.
 
 ### `create_directory`
-Accept a validated relative name under a configured root. Resolve and validate final path; reject traversal and unsafe symlink escapes; bind approval to exact operation and target; create and verify directory. Report existing directory distinctly.
+Accept a validated direct-child name under a pre-existing configured root. Reject traversal, symlinks, junctions, and unsafe filesystem races; bind approval to the exact operation; create and verify the directory. Report existing directory distinctly. Nested creation is intentionally rejected because portable Python filesystem APIs do not provide a no-follow atomic guarantee across platforms.
 
 ## 6. Approval
 Approval is bound to exact tool and validated arguments, expires, and is invalidated if parameters change. Denial/cancellation prevents execution.
@@ -64,6 +64,9 @@ Tools return `success`, `status`, `verified`, and a safe message. Model text is 
 - System info exposes only documented fields.
 - Provider outage produces clear error.
 - Audit history excludes secrets.
+- Unauthenticated chat, conversation, tool, and approval requests are rejected.
+- Non-loopback server configuration fails closed.
+- Disallowed browser origins cannot change tool or approval state.
 
 ## 9. Out of scope
 Arbitrary terminal commands, bulk deletion, external messaging, unattended background actions, unrestricted screen/mouse control.

@@ -8,12 +8,17 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
-from app.main import app
+from app.main import _redact_request_path, app
 from app.schemas.approval import ApprovalRequest, ApprovalStatus
 from app.schemas.policy import RiskLevel
 from app.schemas.tool import ToolDefinition
-from app.services.approval_service import ApprovalPolicyError, ApprovalService
+from app.services.approval_service import (
+    ApprovalIntegrityError,
+    ApprovalPolicyError,
+    ApprovalService,
+)
 from app.services.approval_store import (
+    ApprovalCapacityError,
     ApprovalStateError,
     ApprovalStore,
 )
@@ -24,9 +29,13 @@ from app.services.tool_registry import ToolRegistry, tool_registry
 
 
 @pytest_asyncio.fixture
-async def client():
+async def client(api_headers):
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as ac:
         yield ac
 
 
@@ -227,6 +236,71 @@ async def test_invocation_returns_pending_approval_without_launching(
 
 
 @pytest.mark.asyncio
+async def test_unauthenticated_client_cannot_invoke_tool():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://127.0.0.1"
+    ) as unauthenticated:
+        response = await unauthenticated.post(
+            "/api/tools/open_application/invoke",
+            json={"arguments": {"app_id": "notepad"}},
+        )
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_client_cannot_execute_system_info():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://127.0.0.1"
+    ) as unauthenticated:
+        response = await unauthenticated.get("/api/system-info")
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_disallowed_origin_cannot_create_approval(client: AsyncClient):
+    response = await client.post(
+        "/api/tools/open_application/invoke",
+        json={"arguments": {"app_id": "notepad"}},
+        headers={"Origin": "https://evil.example"},
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_approval_is_bound_to_authenticated_session(
+    client: AsyncClient, monkeypatch
+):
+    popen = Mock()
+    monkeypatch.setattr(open_application_tool, "WINDOWS_PLATFORM", True)
+    monkeypatch.setattr(open_application_tool.subprocess, "Popen", popen)
+    requested = await client.post(
+        "/api/tools/open_application/invoke",
+        json={"arguments": {"app_id": "notepad"}},
+    )
+    approval_id = requested.json()["approval_id"]
+
+    other_session = await client.post(
+        f"/api/approvals/{approval_id}/approve",
+        headers={"X-JARVIS-Session": "other-session-0123456789"},
+    )
+
+    assert other_session.status_code == 404
+    popen.assert_not_called()
+
+    approved = await client.post(f"/api/approvals/{approval_id}/approve")
+
+    assert approved.status_code == 200
+    popen.assert_called_once_with(
+        [open_application_tool.APPLICATION_ALLOWLIST["notepad"]], shell=False
+    )
+
+
+@pytest.mark.asyncio
 async def test_approval_api_approve_executes_once(client: AsyncClient, monkeypatch):
     popen = Mock()
     monkeypatch.setattr(open_application_tool, "WINDOWS_PLATFORM", True)
@@ -245,7 +319,9 @@ async def test_approval_api_approve_executes_once(client: AsyncClient, monkeypat
     assert approved.json()["status"] == "success"
     assert replay.status_code == 409
     assert state.json()["status"] == "EXECUTED"
-    popen.assert_called_once_with(["notepad.exe"], shell=False)
+    popen.assert_called_once_with(
+        [open_application_tool.APPLICATION_ALLOWLIST["notepad"]], shell=False
+    )
 
 
 @pytest.mark.asyncio
@@ -287,7 +363,9 @@ async def test_approval_api_ignores_argument_changes_from_approver(
     )
 
     assert approved.status_code == 200
-    popen.assert_called_once_with(["notepad.exe"], shell=False)
+    popen.assert_called_once_with(
+        [open_application_tool.APPLICATION_ALLOWLIST["notepad"]], shell=False
+    )
 
 
 @pytest.mark.asyncio
@@ -295,3 +373,64 @@ async def test_approval_api_unknown_request_is_404(client: AsyncClient):
     response = await client.get("/api/approvals/does-not-exist")
 
     assert response.status_code == 404
+
+
+def test_approval_store_is_bounded_and_cleans_terminal_entries():
+    current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+    store = ApprovalStore(
+        ttl_seconds=1,
+        max_entries=1,
+        terminal_retention_seconds=1,
+        clock=lambda: current[0],
+    )
+    request = store.create_approval_request(
+        tool_name="open_application",
+        arguments={"app_id": "notepad"},
+        action_description="Open notepad.",
+        risk_level=RiskLevel.LOW_RISK,
+    )
+
+    with pytest.raises(ApprovalCapacityError):
+        store.create_approval_request(
+            tool_name="open_application",
+            arguments={"app_id": "notepad"},
+            action_description="Open notepad.",
+            risk_level=RiskLevel.LOW_RISK,
+        )
+
+    current[0] += timedelta(seconds=2)
+    assert store.get_approval_request(request.approval_id).status is ApprovalStatus.EXPIRED
+    current[0] += timedelta(seconds=2)
+    replacement = store.create_approval_request(
+        tool_name="open_application",
+        arguments={"app_id": "notepad"},
+        action_description="Open notepad.",
+        risk_level=RiskLevel.LOW_RISK,
+    )
+
+    assert replacement.approval_id != request.approval_id
+
+
+def test_tampered_stored_arguments_never_reach_executor(monkeypatch):
+    service, store = _service()
+    execute = Mock()
+    monkeypatch.setattr(service._executor, "execute", execute)
+    request = service.request_tool("open_application", {"app_id": "notepad"})
+    stored = store.get_approval_request(request.approval_id)
+    store._requests[request.approval_id] = ApprovalRequest(
+        **{
+            **stored.model_dump(),
+            "arguments": {"app_id": "powershell"},
+        }
+    )
+
+    with pytest.raises(ApprovalIntegrityError):
+        service.approve_request(request.approval_id)
+    execute.assert_not_called()
+
+
+def test_approval_ids_are_redacted_from_request_paths():
+    assert (
+        _redact_request_path("/api/approvals/secret-id/approve")
+        == "/api/approvals/<redacted>/approve"
+    )

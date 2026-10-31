@@ -1,8 +1,9 @@
 """System-info endpoint (thin route, logic lives in tool/service layer)."""
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.security import AuthenticatedSession, require_authenticated_session
 from app.schemas.tool import ToolResult
 from app.services.system_info_tool import TOOL_NAME
 from app.services.tool_executor import execute_authorized_tool
@@ -13,7 +14,9 @@ router = APIRouter(tags=["tools"])
 
 
 @router.get("/api/system-info", response_model=ToolResult, status_code=200)
-async def system_info() -> ToolResult:
+async def system_info(
+    _principal: AuthenticatedSession = Depends(require_authenticated_session),
+) -> ToolResult:
     """
     Invoke the read-only get_system_info stub through the tool boundary.
 

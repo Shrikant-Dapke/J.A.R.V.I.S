@@ -2,10 +2,12 @@
 
 import os
 import subprocess
+from pathlib import PureWindowsPath
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.core.config import settings
 from app.schemas.policy import RiskLevel
 from app.schemas.tool import ToolResult
 from app.services.tool_base import Tool
@@ -22,14 +24,39 @@ class OpenApplicationInput(BaseModel):
     app_id: str = Field(min_length=1, max_length=32, pattern=r"^[a-z0-9_-]+$")
 
 
-# Values are fixed by the application, never supplied by the model or caller.
-APPLICATION_ALLOWLIST: dict[str, str] = {
-    "notepad": "notepad.exe",
-    "calculator": "calc.exe",
-    "code": "code.exe",
-    "explorer": "explorer.exe",
-}
 WINDOWS_PLATFORM = os.name == "nt"
+
+
+def _validated_absolute_windows_path(value: str) -> str:
+    """Return an absolute path without traversal or search-path resolution."""
+    path = PureWindowsPath(value)
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise RuntimeError("Configured application paths must be absolute and clean")
+    return str(path)
+
+
+_system_root = _validated_absolute_windows_path(
+    os.environ.get("SystemRoot", r"C:\Windows")
+)
+_system_root_path = PureWindowsPath(_system_root)
+
+# Values are fixed by the application or trusted local configuration, never
+# supplied by the model or request caller. No PATH lookup is performed.
+APPLICATION_ALLOWLIST: dict[str, str] = {
+    "notepad": _validated_absolute_windows_path(
+        str(_system_root_path / "System32" / "notepad.exe")
+    ),
+    "calculator": _validated_absolute_windows_path(
+        str(_system_root_path / "System32" / "calc.exe")
+    ),
+    "explorer": _validated_absolute_windows_path(
+        str(_system_root_path / "explorer.exe")
+    ),
+}
+if settings.code_executable_path:
+    APPLICATION_ALLOWLIST["code"] = _validated_absolute_windows_path(
+        settings.code_executable_path
+    )
 
 
 class OpenApplicationTool(Tool[OpenApplicationInput]):

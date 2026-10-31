@@ -1,8 +1,13 @@
 """Conversation context endpoints (thin routes, logic lives in store)."""
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Depends, status
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.security import (
+    AuthenticatedSession,
+    require_authenticated_session,
+    require_safe_origin,
+)
 from app.schemas.conversation import (
     ConversationClearResponse,
     ConversationHistoryResponse,
@@ -18,9 +23,16 @@ router = APIRouter(tags=["conversations"])
     response_model=ConversationHistoryResponse,
     status_code=200,
 )
-async def get_conversation(conversation_id: str) -> ConversationHistoryResponse:
-    """Return ordered turns and total turn count for a conversation."""
-    turns = conversation_store.get_history(conversation_id)
+async def get_conversation(
+    conversation_id: str,
+    principal: AuthenticatedSession = Depends(require_authenticated_session),
+) -> ConversationHistoryResponse:
+    """Return the authenticated session's ordered turns and turn count."""
+    turns = conversation_store.get_history(
+        conversation_id,
+        owner_id=principal.owner_id,
+        session_id=principal.session_id,
+    )
     if turns is None:
         raise StarletteHTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -38,9 +50,17 @@ async def get_conversation(conversation_id: str) -> ConversationHistoryResponse:
     response_model=ConversationClearResponse,
     status_code=200,
 )
-async def delete_conversation(conversation_id: str) -> ConversationClearResponse:
-    """Delete a conversation from the in-memory store."""
-    deleted = conversation_store.clear_conversation(conversation_id)
+async def delete_conversation(
+    conversation_id: str,
+    principal: AuthenticatedSession = Depends(require_authenticated_session),
+    _origin: None = Depends(require_safe_origin),
+) -> ConversationClearResponse:
+    """Delete the authenticated session's conversation from the store."""
+    deleted = conversation_store.clear_conversation(
+        conversation_id,
+        owner_id=principal.owner_id,
+        session_id=principal.session_id,
+    )
     if not deleted:
         raise StarletteHTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

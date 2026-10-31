@@ -11,11 +11,22 @@ from app.schemas.chat import MAX_MESSAGE_LENGTH
 
 
 @pytest_asyncio.fixture
-async def client():
-    """Create an async test client."""
+async def client(api_headers):
+    """Create an async test client for the authenticated local owner."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as ac:
         yield ac
+
+
+def _unauthenticated_client():
+    return AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://127.0.0.1",
+    )
 
 
 @pytest.mark.asyncio
@@ -141,3 +152,150 @@ async def test_chat_structured_validation_errors(client: AsyncClient):
     data = response.json()
     assert data["error"]["code"] == "VALIDATION_ERROR"
     assert "request_id" in data["error"]
+
+
+# Authentication and origin security tests
+
+
+@pytest.mark.asyncio
+async def test_chat_missing_authentication_rejected(client: AsyncClient):
+    """API chat requests without credentials receive structured 401."""
+    async with _unauthenticated_client() as unauthenticated:
+        response = await unauthenticated.post(
+            "/api/chat", json={"message": "Hello"}
+        )
+    assert response.status_code == 401
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_401"
+    assert "request_id" in data["error"]
+    assert data["error"]["message"] == "Authentication is required."
+
+
+@pytest.mark.asyncio
+async def test_chat_invalid_token_rejected(client: AsyncClient):
+    """A wrong bearer token is rejected with structured 401."""
+    async with _unauthenticated_client() as unauthenticated:
+        response = await unauthenticated.post(
+            "/api/chat",
+            json={"message": "Hello"},
+            headers={
+                "Authorization": "Bearer invalid-invalid-invalid-invalid-invalid",
+                "X-JARVIS-Session": "invalid-token-session-012345678",
+            },
+        )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "HTTP_401"
+
+
+@pytest.mark.asyncio
+async def test_chat_non_bearer_authorization_scheme_rejected(client: AsyncClient):
+    """Authorization schemes other than Bearer are rejected with 401."""
+    async with _unauthenticated_client() as unauthenticated:
+        response = await unauthenticated.post(
+            "/api/chat",
+            json={"message": "Hello"},
+            headers={
+                "Authorization": "Basic invalid-invalid-invalid-invalid-invalid",
+                "X-JARVIS-Session": "invalid-token-session-012345678",
+            },
+        )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "HTTP_401"
+
+
+@pytest.mark.asyncio
+async def test_chat_missing_session_id_rejected(api_headers):
+    """Valid token without the session header is rejected with 401."""
+    async with _unauthenticated_client() as unauthenticated:
+        response = await unauthenticated.post(
+            "/api/chat",
+            json={"message": "Hello"},
+            headers={"Authorization": api_headers["Authorization"]},
+        )
+    assert response.status_code == 401
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_401"
+    assert data["error"]["message"] == "An authenticated client session is required."
+
+
+@pytest.mark.asyncio
+async def test_chat_invalid_session_id_rejected(api_headers):
+    """Session identifiers outside the allowed format are rejected."""
+    async with _unauthenticated_client() as unauthenticated:
+        response = await unauthenticated.post(
+            "/api/chat",
+            json={"message": "Hello"},
+            headers={
+                "Authorization": api_headers["Authorization"],
+                "X-JARVIS-Session": "bad session id!@#",
+            },
+        )
+    assert response.status_code == 401
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_401"
+    assert data["error"]["message"] == "An authenticated client session is required."
+
+
+@pytest.mark.asyncio
+async def test_chat_valid_authenticated_request(client: AsyncClient):
+    """Authenticated chat succeeds with the existing response contract."""
+    response = await client.post("/api/chat", json={"message": "Hello"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["response"] == "JARVIS assistant core is online."
+    assert data["status"] == "success"
+    assert "conversation_id" in data
+
+
+@pytest.mark.asyncio
+async def test_chat_disallowed_origin_rejected(client: AsyncClient):
+    """State-changing chat requests from unconfigured origins fail closed."""
+    response = await client.post(
+        "/api/chat",
+        json={"message": "Hello"},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_403"
+    assert data["error"]["message"] == "The request origin is not allowed."
+
+
+@pytest.mark.asyncio
+async def test_chat_native_client_without_origin_allowed(client: AsyncClient):
+    """Native clients that send no Origin header keep working."""
+    response = await client.post("/api/chat", json={"message": "Hello"})
+    assert response.status_code == 200
+
+
+# Conversation ownership tests
+
+
+@pytest.mark.asyncio
+async def test_chat_rejects_foreign_conversation_id(
+    client: AsyncClient, other_session_headers
+):
+    """A conversation created in one session is never reused by another."""
+    created = await client.post("/api/chat", json={"message": "First"})
+    conv_id = created.json()["conversation_id"]
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://127.0.0.1",
+        headers=other_session_headers,
+    ) as other:
+        response = await other.post(
+            "/api/chat",
+            json={"message": "Hijack", "conversation_id": conv_id},
+        )
+
+    assert response.status_code == 404
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_404"
+
+    retained = await client.get(f"/api/conversations/{conv_id}")
+    assert retained.status_code == 200
+    user_contents = [
+        t["content"] for t in retained.json()["turns"] if t["role"] == "user"
+    ]
+    assert user_contents == ["First"]

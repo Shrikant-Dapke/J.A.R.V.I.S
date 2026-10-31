@@ -7,14 +7,21 @@ import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 
 from app.main import app
-from app.services.conversation_store import conversation_store
+from app.services.conversation_store import (
+    ConversationNotFoundError,
+    conversation_store,
+)
 
 
 @pytest_asyncio.fixture
-async def client():
-    """Create an async test client."""
+async def client(api_headers):
+    """Create an async test client for the authenticated local owner."""
     transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers=api_headers,
+    ) as ac:
         yield ac
 
 
@@ -190,4 +197,230 @@ async def test_health_still_works(client: AsyncClient):
 async def test_root_still_works(client: AsyncClient):
     """Root endpoint unaffected."""
     response = await client.get("/")
+    assert response.status_code == 200
+
+
+# Authentication, origin, and ownership security tests
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_requires_authentication(client: AsyncClient):
+    """GET /api/conversations/{id} without credentials receives 401."""
+    conv_id = _fresh_id()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://127.0.0.1"
+    ) as unauthenticated:
+        response = await unauthenticated.get(f"/api/conversations/{conv_id}")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "HTTP_401"
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_requires_authentication(client: AsyncClient):
+    """DELETE /api/conversations/{id} without credentials receives 401."""
+    conv_id = _fresh_id()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://127.0.0.1"
+    ) as unauthenticated:
+        response = await unauthenticated.delete(f"/api/conversations/{conv_id}")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "HTTP_401"
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_invalid_token_rejected(client: AsyncClient):
+    """A wrong bearer token cannot read conversation history."""
+    conv_id = _fresh_id()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers={
+            "Authorization": "Bearer invalid-invalid-invalid-invalid-invalid",
+            "X-JARVIS-Session": "invalid-token-session-012345678",
+        },
+    ) as unauthenticated:
+        response = await unauthenticated.get(f"/api/conversations/{conv_id}")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "HTTP_401"
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_missing_session_id_rejected(api_headers):
+    """A valid token without the session header cannot delete state."""
+    conv_id = _fresh_id()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://127.0.0.1",
+        headers={"Authorization": api_headers["Authorization"]},
+    ) as unauthenticated:
+        response = await unauthenticated.delete(f"/api/conversations/{conv_id}")
+    assert response.status_code == 401
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_401"
+    assert data["error"]["message"] == "An authenticated client session is required."
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_returns_history(client: AsyncClient):
+    """Authenticated retrieval returns the conversation contract."""
+    conv_id = _fresh_id()
+    await client.post(
+        "/api/chat", json={"message": "Ping", "conversation_id": conv_id}
+    )
+    response = await client.get(f"/api/conversations/{conv_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["conversation_id"] == conv_id
+    assert data["turn_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_of_other_session_is_404(
+    client: AsyncClient, other_session_headers
+):
+    """Conversations of another session are indistinguishable from unknown."""
+    conv_id = _fresh_id()
+    await client.post(
+        "/api/chat", json={"message": "Private", "conversation_id": conv_id}
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://127.0.0.1",
+        headers=other_session_headers,
+    ) as other:
+        response = await other.get(f"/api/conversations/{conv_id}")
+
+    assert response.status_code == 404
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_404"
+    retained = await client.get(f"/api/conversations/{conv_id}")
+    assert retained.status_code == 200
+    assert retained.json()["turn_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_of_other_session_is_404(
+    client: AsyncClient, other_session_headers
+):
+    """Another session cannot delete conversations it does not own."""
+    conv_id = _fresh_id()
+    await client.post(
+        "/api/chat", json={"message": "Keep me", "conversation_id": conv_id}
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://127.0.0.1",
+        headers=other_session_headers,
+    ) as other:
+        response = await other.delete(f"/api/conversations/{conv_id}")
+
+    assert response.status_code == 404
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_404"
+    retained = await client.get(f"/api/conversations/{conv_id}")
+    assert retained.status_code == 200
+    assert retained.json()["turn_count"] == 2
+
+
+def test_conversation_store_rejects_cross_owner_access():
+    """The store itself isolates owner-scoped access beyond session."""
+    owner_id = "hash-of-owner-one"
+    session_id = "session-one-0123456789012345"
+    conv_id = conversation_store.create_conversation(
+        owner_id=owner_id, session_id=session_id
+    )
+    conversation_store.add_turn(
+        conv_id,
+        "user",
+        "Top secret",
+        owner_id=owner_id,
+        session_id=session_id,
+    )
+
+    # Different owner, same session.
+    assert (
+        conversation_store.get_history(
+            conv_id,
+            owner_id="hash-of-owner-two",
+            session_id=session_id,
+        )
+        is None
+    )
+    assert (
+        conversation_store.clear_conversation(
+            conv_id,
+            owner_id="hash-of-owner-two",
+            session_id=session_id,
+        )
+        is False
+    )
+    # Same owner, different session.
+    assert (
+        conversation_store.get_history(
+            conv_id,
+            owner_id=owner_id,
+            session_id="session-two-012345678901234",
+        )
+        is None
+    )
+    with pytest.raises(ConversationNotFoundError):
+        conversation_store.add_turn(
+            conv_id,
+            "user",
+            "Late injection",
+            owner_id="hash-of-owner-two",
+            session_id=session_id,
+        )
+
+    original = conversation_store.get_history(
+        conv_id, owner_id=owner_id, session_id=session_id
+    )
+    assert original is not None
+    assert [t.content for t in original] == ["Top secret"]
+    assert (
+        conversation_store.clear_conversation(
+            conv_id, owner_id=owner_id, session_id=session_id
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_conversation_disallowed_origin_rejected(client: AsyncClient):
+    """State-changing DELETE from unconfigured origins fails closed."""
+    conv_id = _fresh_id()
+    await client.post(
+        "/api/chat", json={"message": "Survive", "conversation_id": conv_id}
+    )
+    response = await client.delete(
+        f"/api/conversations/{conv_id}",
+        headers={"Origin": "https://evil.example"},
+    )
+    assert response.status_code == 403
+    data = response.json()
+    assert data["error"]["code"] == "HTTP_403"
+    assert data["error"]["message"] == "The request origin is not allowed."
+
+    # Cross-origin rejection must not have destroyed state.
+    retained = await client.get(f"/api/conversations/{conv_id}")
+    assert retained.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_get_conversation_ignores_origin_header(client: AsyncClient):
+    """Read-only GET requests are not subjected to origin validation."""
+    conv_id = _fresh_id()
+    await client.post(
+        "/api/chat", json={"message": "Readable", "conversation_id": conv_id}
+    )
+    response = await client.get(
+        f"/api/conversations/{conv_id}",
+        headers={"Origin": "https://evil.example"},
+    )
     assert response.status_code == 200

@@ -7,6 +7,8 @@ from app.schemas.approval import ApprovalRequest
 from app.schemas.policy import PolicyDecision
 from app.schemas.tool import ToolResult
 from app.services.approval_store import (
+    DEFAULT_OWNER_ID,
+    DEFAULT_SESSION_ID,
     ApprovalStore,
     approval_store,
 )
@@ -77,6 +79,8 @@ class ApprovalService:
         self,
         tool_name: str,
         arguments: Mapping[str, Any] | None = None,
+        owner_id: str = DEFAULT_OWNER_ID,
+        session_id: str = DEFAULT_SESSION_ID,
     ) -> ApprovalWorkflowResult:
         """Execute read-only tools or create a pending exact approval."""
         decision = self._decision(tool_name)
@@ -105,20 +109,37 @@ class ApprovalService:
                 tool_name, definition.description, normalized
             ),
             risk_level=decision.risk_level,
+            owner_id=owner_id,
+            session_id=session_id,
         )
         return request
 
-    def get_request(self, approval_id: str) -> ApprovalRequest:
+    def get_request(
+        self,
+        approval_id: str,
+        owner_id: str = DEFAULT_OWNER_ID,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> ApprovalRequest:
         """Return approval state with lazy expiration applied."""
-        return self._store.get_approval_request(approval_id)
+        return self._store.get_approval_request(approval_id, owner_id, session_id)
 
-    def reject_request(self, approval_id: str) -> ApprovalRequest:
+    def reject_request(
+        self,
+        approval_id: str,
+        owner_id: str = DEFAULT_OWNER_ID,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> ApprovalRequest:
         """Reject a pending request without reaching the executor."""
-        return self._store.reject_request(approval_id)
+        return self._store.reject_request(approval_id, owner_id, session_id)
 
-    def approve_request(self, approval_id: str) -> ToolResult:
+    def approve_request(
+        self,
+        approval_id: str,
+        owner_id: str = DEFAULT_OWNER_ID,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> ToolResult:
         """Authorize, consume, and execute exactly one approved request."""
-        request = self._store.get_approval_request(approval_id)
+        request = self._store.get_approval_request(approval_id, owner_id, session_id)
         decision = self._decision(request.tool_name)
         if decision.allowed or not decision.requires_approval:
             raise ApprovalPolicyError(
@@ -145,9 +166,20 @@ class ApprovalService:
             raise ApprovalIntegrityError(
                 "The approved arguments no longer match the original request."
             )
+        if not self._store.arguments_match_original(
+            approval_id,
+            request.arguments,
+            owner_id,
+            session_id,
+        ):
+            raise ApprovalIntegrityError(
+                "The approved arguments failed integrity verification."
+            )
 
-        self._store.approve_request(approval_id)
-        consumed = self._store.claim_approved_for_execution(approval_id)
+        self._store.approve_request(approval_id, owner_id, session_id)
+        consumed = self._store.claim_approved_for_execution(
+            approval_id, owner_id, session_id
+        )
         try:
             return self._executor.execute(consumed.tool_name, consumed.arguments)
         except ValueError as exc:

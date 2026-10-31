@@ -2,10 +2,12 @@
 
 import time
 import uuid
+import re
 from contextlib import asynccontextmanager
 from typing import Callable
 
 from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -17,6 +19,7 @@ from app.api.system_info import router as system_info_router
 from app.api.tools import router as tools_router
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
+from app.core.security import allowed_origins, is_loopback_host
 
 
 logger = get_logger(__name__)
@@ -24,6 +27,7 @@ logger = get_logger(__name__)
 
 CORRELATION_ID_HEADER = "X-Request-ID"
 MAX_CORRELATION_ID_LENGTH = 128
+APPROVAL_PATH_PATTERN = re.compile(r"(/api/approvals/)[^/]+")
 
 
 @asynccontextmanager
@@ -43,6 +47,23 @@ app = FastAPI(
     description="JARVIS - Just A Rather Very Intelligent System",
     lifespan=lifespan,
 )
+
+configured_origins = allowed_origins()
+if configured_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=configured_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-JARVIS-Session",
+            "X-JARVIS-Token",
+            CORRELATION_ID_HEADER,
+        ],
+        expose_headers=[CORRELATION_ID_HEADER],
+    )
 
 
 def _validate_correlation_id(value: str) -> str:
@@ -70,6 +91,25 @@ def _sanitize_for_json(obj):
     return str(obj)
 
 
+def _safe_validation_errors(errors: list[dict]) -> list[dict]:
+    """Keep validation metadata while excluding raw user-provided values."""
+    safe_errors = []
+    for error in errors:
+        safe_errors.append(
+            {
+                "type": str(error.get("type", "validation_error")),
+                "loc": _sanitize_for_json(error.get("loc", [])),
+                "msg": str(error.get("msg", "Request validation failed")),
+            }
+        )
+    return safe_errors
+
+
+def _redact_request_path(path: str) -> str:
+    """Avoid writing bearer-like approval IDs to request logs."""
+    return APPROVAL_PATH_PATTERN.sub(r"\1<redacted>", path)
+
+
 def _create_error_response(
     request: Request,
     status_code: int,
@@ -90,6 +130,23 @@ def _create_error_response(
     if correlation_id:
         content["error"]["request_id"] = correlation_id
     return JSONResponse(content=content, status_code=status_code)
+
+
+@app.middleware("http")
+async def loopback_binding_middleware(request: Request, call_next: Callable):
+    """Reject requests if the ASGI server is bound beyond loopback."""
+    server = request.scope.get("server")
+    if server is not None and not is_loopback_host(server[0]):
+        return JSONResponse(
+            content={
+                "error": {
+                    "code": "HTTP_503",
+                    "message": "The API is configured for loopback access only.",
+                }
+            },
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -119,7 +176,7 @@ async def request_logging_middleware(request: Request, call_next: Callable):
             extra={
                 "extra_fields": {
                     "method": request.method,
-                    "path": request.url.path,
+                    "path": _redact_request_path(request.url.path),
                     "status_code": response.status_code,
                     "duration_ms": round(duration_ms, 2),
                     "correlation_id": correlation_id,
@@ -127,18 +184,20 @@ async def request_logging_middleware(request: Request, call_next: Callable):
             },
         )
         return response
-    except Exception:
+    except Exception as exc:
         duration_ms = (time.perf_counter() - start_time) * 1000
-        logger.exception(
+        logger.error(
             "HTTP request failed",
             extra={
                 "extra_fields": {
                     "method": request.method,
-                    "path": request.url.path,
+                    "path": _redact_request_path(request.url.path),
                     "duration_ms": round(duration_ms, 2),
                     "correlation_id": correlation_id,
+                    "error_type": type(exc).__name__,
                 }
             },
+            exc_info=exc,
         )
         raise
 
@@ -162,7 +221,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         error_code="VALIDATION_ERROR",
         message="Request validation failed",
-        details={"errors": _sanitize_for_json(exc.errors())},
+        details={"errors": _safe_validation_errors(exc.errors())},
     )
 
 
@@ -170,9 +229,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 async def unhandled_exception_handler(request: Request, exc: Exception):
     """Handle unexpected exceptions without exposing internals."""
     correlation_id = getattr(request.state, "correlation_id", None)
-    logger.exception(
+    logger.error(
         "Unhandled exception",
-        extra={"extra_fields": {"correlation_id": correlation_id, "path": request.url.path}},
+        extra={
+            "extra_fields": {
+                "correlation_id": correlation_id,
+                "path": _redact_request_path(request.url.path),
+                "error_type": type(exc).__name__,
+            }
+        },
     )
     return _create_error_response(
         request=request,

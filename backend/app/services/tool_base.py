@@ -95,7 +95,7 @@ class Tool(ABC, Generic[InputModelT]):
                 message=exc.safe_message,
             )
         except Exception as exc:  # pragma: no cover - defensive boundary
-            logger.exception(
+            logger.error(
                 "Unexpected controlled tool exception",
                 extra={
                     "extra_fields": {

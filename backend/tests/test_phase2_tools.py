@@ -1,6 +1,7 @@
 """Focused Phase 2 tests for controlled tools and execution boundaries."""
 
 from pathlib import Path
+from pathlib import PureWindowsPath
 from unittest.mock import Mock
 
 import pytest
@@ -92,7 +93,9 @@ def test_open_application_allows_registered_alias_without_running_process(
     result = OpenApplicationTool().invoke({"app_id": "notepad"})
 
     assert result.success is True
-    popen.assert_called_once_with(["notepad.exe"], shell=False)
+    popen.assert_called_once_with(
+        [open_application_tool.APPLICATION_ALLOWLIST["notepad"]], shell=False
+    )
 
 
 def test_open_application_rejects_unknown_alias(monkeypatch):
@@ -151,6 +154,50 @@ def test_create_directory_existing_directory_is_distinct(tmp_path: Path):
     assert result.status == "already_exists"
 
 
+def test_create_directory_rejects_nested_paths_without_safe_no_follow_support(
+    tmp_path: Path,
+):
+    tool = CreateDirectoryTool(tmp_path)
+
+    result = tool.invoke({"path": "reports/quarterly"})
+
+    assert result.success is False
+    assert result.error_code == "unsafe_path"
+    assert not (tmp_path / "reports").exists()
+
+
+def test_create_directory_rejects_symlink_target(tmp_path: Path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    link = tmp_path / "linked"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlink creation is unavailable in this environment")
+
+    result = CreateDirectoryTool(tmp_path).invoke({"path": "linked"})
+
+    assert result.success is False
+    assert result.error_code == "unsafe_path"
+    assert not (outside / "created").exists()
+
+
+def test_create_directory_fails_closed_for_link_like_target(
+    tmp_path: Path, monkeypatch
+):
+    tool = CreateDirectoryTool(tmp_path)
+    monkeypatch.setattr(
+        tool,
+        "_is_link_like",
+        lambda path: path.name == "linked",
+    )
+
+    result = tool.invoke({"path": "linked"})
+
+    assert result.success is False
+    assert result.error_code == "unsafe_path"
+
+
 @pytest.mark.parametrize("unsafe_path", ["../outside", "C:\\outside", "/outside"])
 def test_create_directory_rejects_unsafe_paths(tmp_path: Path, unsafe_path: str):
     tool = CreateDirectoryTool(tmp_path)
@@ -179,3 +226,11 @@ def test_create_directory_handles_permission_error(tmp_path: Path, monkeypatch):
 def test_builtin_tools_require_future_policy_approval():
     assert create_directory_tool.CREATE_DIRECTORY_TOOL.requires_approval is True
     assert open_application_tool.OPEN_APPLICATION_TOOL.requires_approval is True
+
+
+def test_application_allowlist_contains_only_absolute_windows_paths():
+    assert open_application_tool.APPLICATION_ALLOWLIST
+    assert all(
+        PureWindowsPath(path).is_absolute()
+        for path in open_application_tool.APPLICATION_ALLOWLIST.values()
+    )
