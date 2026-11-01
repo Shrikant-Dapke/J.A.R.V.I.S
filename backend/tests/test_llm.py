@@ -18,6 +18,7 @@ from app.core.config import Settings, settings
 from app.main import app
 from app.schemas.llm import LLMMessage, LLMResponse
 from app.services.chat_service import get_chat_response
+from app.services.orchestrator import ORCHESTRATOR_INSTRUCTION_PREFIX
 from app.services.conversation_store import (
     ConversationNotFoundError,
     conversation_store,
@@ -125,7 +126,14 @@ def test_chat_service_uses_provider(provider_override):
 
 
 def test_conversation_history_passed_to_provider(provider_override):
-    """Provider receives full chronological history including new turn."""
+    """Provider receives full chronological history plus the orchestrator
+    decision instruction.
+
+    Phase 4 contract change: the Main Orchestrator appends one trusted,
+    bounded instruction message as the FINAL user turn of the same
+    provider call. The instruction is never persisted in the
+    conversation history; the caller's turns are forwarded untouched.
+    """
     recorder = RecordingProvider()
     set_llm_provider_override(recorder)
     conv_id = str(uuid.uuid4())
@@ -137,15 +145,29 @@ def test_conversation_history_passed_to_provider(provider_override):
         "Second", conv_id, owner_id=SERVICE_OWNER_ID, session_id=SERVICE_SESSION_ID
     )
 
+    # One bounded decision call per turn (reply text never triggers a summary call).
     assert len(recorder.seen) == 2
+
     first_call = [(m.role, m.content) for m in recorder.seen[0]]
-    assert first_call == [("user", "First")]
+    # History precedes the appended instruction message.
+    assert first_call[:-1] == [("user", "First")]
+    first_instruction_role, first_instruction_content = first_call[-1]
+    assert first_instruction_role == "user"
+    assert ORCHESTRATOR_INSTRUCTION_PREFIX in first_instruction_content
+    assert "USER REQUEST:" in first_instruction_content
+    assert "First" in first_instruction_content
+
     second_call = [(m.role, m.content) for m in recorder.seen[1]]
-    assert second_call == [
+    assert second_call[:-1] == [
         ("user", "First"),
         ("assistant", "recorded-reply"),
         ("user", "Second"),
     ]
+    second_instruction_role, second_instruction_content = second_call[-1]
+    assert second_instruction_role == "user"
+    assert ORCHESTRATOR_INSTRUCTION_PREFIX in second_instruction_content
+    assert "USER REQUEST:" in second_instruction_content
+    assert "Second" in second_instruction_content
 
 
 def test_chat_service_never_appends_to_foreign_conversation(provider_override):

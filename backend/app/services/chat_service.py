@@ -1,12 +1,17 @@
-"""Chat service: conversation context -> LLM provider -> stored reply."""
+"""Chat service: conversation context -> orchestrator -> stored reply.
 
-import uuid
+Phase 4: the main orchestrator (``ChatOrchestrator``) sits behind this
+thin service boundary. Conversation storage, ownership checks, provider
+calls, structured decision validation, policy, approval, and tool
+execution all live in the orchestrator and its existing collaborators;
+this module only preserves the Phase 2/3 service contract for callers
+``app.api.chat`` and existing tests.
+"""
+
 from typing import Optional
 
 from app.schemas.chat import ChatResponse
-from app.schemas.llm import LLMMessage
-from app.services.conversation_store import conversation_store
-from app.services.llm.factory import get_llm_provider
+from app.services.orchestrator import chat_orchestrator
 
 
 def get_chat_response(
@@ -17,51 +22,36 @@ def get_chat_response(
     session_id: str,
 ) -> ChatResponse:
     """
-    Store the user turn, generate a reply via the LLM provider, store it.
+    Handle one authenticated user turn through the orchestrator.
 
     The conversation is called in under the authenticated identity
     (owner_id, session_id). Turns are appended only to conversations the
     caller owns; a caller-supplied conversation created in another
     identity raises ConversationNotFoundError instead of being reused.
 
-    Flow: obtain/create conversation -> store user turn ->
-    provider(history) -> store assistant turn -> return response.
-
-    Provider output is untrusted text: stored and returned verbatim,
-    never executed or interpreted.
+    The orchestrator validates the parsed decision, and either returns
+    a conversational reply, a pending
+    approval proposal (mutating actions; nothing executes), the outcome
+    of a policy-allowed read-only tool, or a captured task plan.
+    Provider failures propagate to the route for safe structured
+    mapping.
 
     Raises:
         ConversationNotFoundError: If the conversation exists but is
             bound to a different owner or session.
         LLMError: On provider configuration, API, timeout, or
             invalid-response failures (mapped to HTTP by the route).
+        OrchestrationInvalidProposalError: When the model returns a
+            decision-shaped proposal that fails validation (mapped to
+            HTTP 422 by the route).
+        ApprovalCapacityError: When the approval store is unavailable
+            for a tool proposal (mapped to HTTP 503; nothing executes).
+        ApprovalWorkflowError: When policy denies the proposed tool
+            (mapped to HTTP 403).
     """
-    resolved_id = conversation_id.strip() if conversation_id else None
-    if not resolved_id:
-        resolved_id = str(uuid.uuid4())
-
-    conversation_store.create_conversation(
-        resolved_id, owner_id=owner_id, session_id=session_id
-    )
-    conversation_store.add_turn(
-        resolved_id, "user", message, owner_id=owner_id, session_id=session_id
-    )
-
-    history = conversation_store.get_history(
-        resolved_id, owner_id=owner_id, session_id=session_id
-    ) or []
-    messages = [
-        LLMMessage(role=turn.role, content=turn.content) for turn in history
-    ]
-
-    result = get_llm_provider().generate_response(messages)
-
-    conversation_store.add_turn(
-        resolved_id, "assistant", result.content, owner_id=owner_id, session_id=session_id
-    )
-
-    return ChatResponse(
-        conversation_id=resolved_id,
-        response=result.content,
-        status="success",
+    return chat_orchestrator.handle_chat_message(
+        message,
+        conversation_id,
+        owner_id=owner_id,
+        session_id=session_id,
     )

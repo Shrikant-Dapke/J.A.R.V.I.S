@@ -1,6 +1,6 @@
 """Policy-aware approval workflow between proposals and tool execution."""
 
-from typing import Any, Mapping, Union
+from typing import Any, Callable, Mapping, Optional, Union
 
 from app.core.logging import get_logger
 from app.schemas.approval import ApprovalRequest
@@ -50,6 +50,42 @@ class ApprovalService:
         self._registry = registry
         self._executor = executor
         self._store = store
+        self._on_resolved: Optional[
+            Callable[[str, str, str, ToolResult], None]
+        ] = None
+
+    def set_outcome_listener(
+        self,
+        listener: Callable[[str, str, str, ToolResult], None],
+    ) -> None:
+        """Bind a listener notified when this workflow resolves an approval.
+
+        The listener receives (approval_id, owner_id, session_id,
+        ToolResult) at the moment the outcome is authoritative — for
+        approve→execute and reject. Storage consumers such as the plan
+        service use it to record outcomes without later approval-record
+        reads (which terminal retention may purge).
+        """
+        self._on_resolved = listener
+
+    def _notify_resolved(
+        self,
+        approval_id: str,
+        owner_id: str,
+        session_id: str,
+        result: ToolResult,
+    ) -> None:
+        """Deliver an authoritative outcome (listener failures are logged)."""
+        listener = self._on_resolved
+        if listener is None:
+            return
+        try:
+            listener(approval_id, owner_id, session_id, result)
+        except Exception as exc:  # bookkeeping must not hide the outcome
+            logger.warning(
+                "Approval outcome listener failed",
+                extra={"extra_fields": {"error_type": type(exc).__name__}},
+            )
 
     @staticmethod
     def _action_description(
@@ -130,7 +166,18 @@ class ApprovalService:
         session_id: str = DEFAULT_SESSION_ID,
     ) -> ApprovalRequest:
         """Reject a pending request without reaching the executor."""
-        return self._store.reject_request(approval_id, owner_id, session_id)
+        request = self._store.reject_request(approval_id, owner_id, session_id)
+        self._notify_resolved(
+            approval_id,
+            owner_id,
+            session_id,
+            ToolResult.failure_result(
+                tool_name=request.tool_name,
+                error_code="action_rejected",
+                message="The proposed action was rejected.",
+            ),
+        )
+        return request
 
     def approve_request(
         self,
@@ -181,7 +228,7 @@ class ApprovalService:
             approval_id, owner_id, session_id
         )
         try:
-            return self._executor.execute(consumed.tool_name, consumed.arguments)
+            result = self._executor.execute(consumed.tool_name, consumed.arguments)
         except ValueError as exc:
             logger.warning(
                 "Approved tool had no executable implementation",
@@ -192,11 +239,13 @@ class ApprovalService:
                     }
                 },
             )
-            return ToolResult.failure_result(
+            result = ToolResult.failure_result(
                 tool_name=consumed.tool_name,
                 error_code="tool_unavailable",
                 message="The approved tool is not available for execution.",
             )
+        self._notify_resolved(approval_id, owner_id, session_id, result)
+        return result
 
 
 approval_service = ApprovalService()

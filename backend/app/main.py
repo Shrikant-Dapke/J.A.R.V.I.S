@@ -17,6 +17,7 @@ from app.api.conversations import router as conversations_router
 from app.api.approvals import router as approvals_router
 from app.api.system_info import router as system_info_router
 from app.api.tools import router as tools_router
+from app.api.plans import router as plans_router
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
 from app.core.security import allowed_origins, is_loopback_host
@@ -252,6 +253,7 @@ app.include_router(conversations_router)
 app.include_router(approvals_router)
 app.include_router(system_info_router)
 app.include_router(tools_router)
+app.include_router(plans_router)
 
 
 @app.get("/api/health", tags=["health"])

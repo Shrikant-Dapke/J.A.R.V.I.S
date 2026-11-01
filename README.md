@@ -87,13 +87,67 @@ Run tests:
 pytest tests/ -v
 ```
 
+## Intelligent Orchestration (Phase 4)
+
+Chat turns are driven by the Main Orchestrator
+(`backend/app/services/orchestrator.py`): each turn makes **one bounded
+model call** whose output is parsed as a plain reply, a single tool
+proposal, or a bounded task plan. The model can only *request* actions —
+every proposal routes through the existing policy and approval workflow,
+so model output can never bypass or weaken it.
+
+`POST /api/chat` stays HTTP 200 and returns `status`:
+
+| `status` | Meaning |
+|----------|---------|
+| `success` | plain reply, or an executed action with its `tool_result` |
+| `action_proposed` | pending exact-argument approval under `action` |
+| `plan_proposed` | captured, validated task plan under `plan` |
+
+Rejected proposals map to structured errors **without executing
+anything**: `422` (malformed decision, unknown tool, invalid arguments
+or plan, or a message too large for the orchestrator instruction
+budget), `403` (policy deny / approval workflow), `503` (approval or
+plan store at capacity), plus the existing LLM error mappings
+(`502`/`504`/`500`). The complete user request is never silently
+truncated to fit the instruction budget; oversized requests fail
+clearly instead.
+
+### Task plans (Milestone 4.2)
+
+Plans are validated, bounded representations — ≤ 8 steps, unique step
+IDs, dependencies referencing only strictly earlier steps (cycles are
+structurally impossible), registered tools only, string-only arguments.
+Capturing a plan executes nothing; steps run **one at a time, explicitly**:
+
+```text
+GET  /api/plans/{plan_id}                              # inspect plan (approval state reconciled)
+POST /api/plans/{plan_id}/steps/{step_id}/request      # run one ready step through policy/approval
+```
+
+A policy-allowed read-only step executes and returns the `ToolResult`
+(200); a mutating step returns a pending approval (202) bound to the
+exact arguments. There is no scheduler, no auto-advancement, and no
+autonomous loop — the desktop UI decides which step to request next.
+
+Steps are **terminal once resolved** and always carry their recorded
+outcome: `COMPLETED`/`EXECUTED` mean the step's `ToolResult` succeeded
+(approval outcomes are recorded on the step the moment they resolve,
+so they survive approval-record retention), and `FAILED` covers every
+other ending (execution failure, denial, approval expiry, or an
+unavailable tool). A failed, rejected, or expired step cannot be
+re-requested — address the cause and capture a new plan with a new
+chat turn instead.
+
 ## LLM Providers
 
-Three interchangeable providers live behind `backend/app/services/llm/`. The chat
-service contract is unchanged: providers receive the conversation history and
-return plain assistant text only — **the model never executes tools and its
-output is treated as untrusted** (policy and the approval workflow stay in
-control).
+Three interchangeable providers live behind `backend/app/services/llm/`. The
+provider contract is unchanged: providers receive the conversation history
+plus a trailing trusted orchestrator instruction (never persisted) and
+return plain assistant text only. **The model never executes tools and its
+output is treated as untrusted** — the Phase 4 orchestrator parses it into
+a reply, tool proposal, or plan, and all proposals still route through
+policy and the approval workflow.
 
 | Provider | Purpose | Requires |
 |----------|---------|----------|
@@ -177,4 +231,10 @@ point, not a proven optimum.
 | Slow responses | low VRAM, CPU offload | Lower `OLLAMA_NUM_CTX` (e.g. 2048) and retest; keep the backend on loopback |
 
 ## Status
-**Phase 0 — Foundation**
+**Phase 4 — Intelligent Orchestration (Milestones 4.1–4.2)**
+The Main Orchestrator routes chat turns through reply / tool-action /
+task-plan decisions, captures bounded validated task plans, and executes
+steps only one at a time through the existing policy and approval
+workflow. Backend foundation, LLM providers (fake / gemini / ollama),
+and the policy–approval–execution stack are complete and covered by the
+test suite.
