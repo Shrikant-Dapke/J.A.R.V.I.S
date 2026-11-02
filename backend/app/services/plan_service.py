@@ -1,13 +1,19 @@
 """Plan foundation: validated storage and manual single-step execution.
 
-Phase 4 milestone 4.2. This service is deliberately NOT an execution
-engine: it stores validated plans, tracks step status, and executes at
-most one step per explicit call, always through the existing policy and
-approval workflow (`approval_service.request_tool`). There is no
-automatic advancement, no loop, and no step may run before its
-dependencies are verifiably satisfied.
+Phase 4 milestone 4.2 delivered the plan/step model and its explicit
+execution rules. Phase 4.3 moved the storage from process-local
+dictionaries to the shared SQLite execution-state façade so plans,
+their step states, and approval bindings survive restarts, and added
+the lifecycle, recovery-required, and reconciliation machinery described below.
 
-Ownership model mirrors the conversation store: a plan is bound to the
+This service is deliberately NOT an execution engine: it stores
+validated plans, tracks step status, and executes at most one step per
+explicit call, always through the existing policy and approval workflow
+(`approval_service.request_tool`). There is no automatic advancement,
+no loop, and no step may run before its dependencies are verifiably
+satisfied.
+
+Ownership model is persisted with every plan: a plan is bound to the
 (owner_id, session_id) identity that captured it; another identity sees
 it as unknown (404 semantics), never as state it can read or mutate.
 
@@ -18,6 +24,9 @@ Status semantics are kept honest:
   recorded exactly once on the step by the approval-workflow listener.
 - FAILED: any other terminal outcome, always with a recorded result
   (execution failure, rejection, expiry, or unavailable approval).
+- RECOVERY_REQUIRED: a mutating step whose side effect could not be
+  proven (crash after invocation started, or a mutating timeout). It is
+  non-terminal and resolves only through explicit reconciliation.
 
 Approval outcomes are attached to their owning plan step the moment the
 approval workflow resolves them (approve/execute, reject) — never by
@@ -28,9 +37,7 @@ make a dependent ready on status alone.
 
 Failed, rejected, expired, and unavailable steps are terminal: a new
 plan must be captured instead of repeating the same execution request.
-
-There is no automatic advancement, no loop, and no step may run before
-its dependencies are verifiably satisfied.
+Uncertain steps require an explicit, human-initiated resolution.
 """
 
 import threading
@@ -51,6 +58,16 @@ from app.services.approval_service import ApprovalService, approval_service
 from app.services.approval_store import ApprovalNotFoundError
 from app.services.tool_executor import ToolNotImplementedError
 from app.services.tool_registry import ToolRegistry, UnknownToolError, tool_registry
+from app.services.execution_db import ExecutionStateDb
+from app.services.execution_lifecycle import (
+    ERROR_EXECUTION_INTERRUPTED,
+    ERROR_EXECUTION_UNCERTAIN,
+    ExecutionLifecycleError,
+    validate_plan_step_transition,
+    EVENT_RECOVERY_REQUIRED,
+    EVENT_RECOVERY_OUTCOME_APPLIED,
+    EVENT_EXECUTION_RECONCILED,
+)
 
 
 logger = get_logger(__name__)
@@ -78,7 +95,7 @@ class PlanStepStateError(ValueError):
 
 
 class PlanCapacityError(RuntimeError):
-    """Raised when the bounded in-memory plan store is exhausted."""
+    """Raised when the bounded plan store is exhausted."""
 
 
 class PlanService:
@@ -91,6 +108,7 @@ class PlanService:
         *,
         max_entries: int = DEFAULT_MAX_PLAN_ENTRIES,
         clock: Optional[Callable[[], datetime]] = None,
+        plans_db: Optional[ExecutionStateDb] = None,
     ) -> None:
         self._registry = registry
         self._approvals = approvals
@@ -99,13 +117,28 @@ class PlanService:
             # owning plan step immediately, so the plan never depends on
             # approval records that terminal retention may purge.
             self._approvals.set_outcome_listener(self.resolve_approval_outcome)
+            # Uncertain mutating outcomes (timeouts with unknown side
+            # effects) move their step to RECOVERY_REQUIRED instead of
+            # success or failure.
+            self._approvals.set_uncertain_listener(self.resolve_step_uncertain)
         if max_entries <= 0:
             raise ValueError("max_entries must be positive")
         self._max_entries = max_entries
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._plans: dict[str, TaskPlan] = {}
-        self._owners: dict[str, tuple[str, str]] = {}
+        if plans_db is not None:
+            self._db = plans_db
+        elif isinstance(self._approvals, ApprovalService):
+            # Share the approvals' façade: one database per object graph
+            # (in-memory for isolated test stores, or the shared file).
+            self._db = self._approvals.execution_db
+        else:
+            self._db = ExecutionStateDb()
         self._lock = threading.RLock()
+
+    @property
+    def execution_db(self) -> ExecutionStateDb:
+        """The façade backing this service's plan persistence."""
+        return self._db
 
     @staticmethod
     def _copy(plan: TaskPlan) -> TaskPlan:
@@ -114,15 +147,19 @@ class PlanService:
 
     def _owned_plan(self, plan_id: str, owner_id: str, session_id: str) -> TaskPlan:
         """Authorize access before any state is read."""
-        plan = self._plans.get(plan_id)
-        identity = self._owners.get(plan_id)
-        if plan is None or identity != (owner_id, session_id):
+        record = self._db.get_plan_record(plan_id)
+        if (
+            record is None
+            or record.owner_id != owner_id
+            or record.session_id != session_id
+        ):
             raise PlanNotFoundError("Plan was not found")
-        return plan
+        return record.plan
 
-    def _store_plan(self, plan: TaskPlan) -> None:
-        self._plans[plan.plan_id] = plan
-        return None
+    def _store_plan(
+        self, plan: TaskPlan, owner_id: str, session_id: str
+    ) -> None:
+        self._db.save_plan(plan, owner_id, session_id)
 
     def create_plan(
         self,
@@ -177,12 +214,11 @@ class PlanService:
             ) from exc
 
         with self._lock:
-            if len(self._plans) >= self._max_entries:
+            if self._db.count_plans() >= self._max_entries:
                 raise PlanCapacityError(
                     "The plan store has reached its configured capacity."
                 )
-            self._plans[plan.plan_id] = self._copy(plan)
-            self._owners[plan.plan_id] = (owner_id, session_id)
+            self._db.save_plan(self._copy(plan), owner_id, session_id)
         return self._copy(plan)
 
     def get_plan(
@@ -198,9 +234,10 @@ class PlanService:
     def _step_succeeded(step: PlanStep) -> bool:
         """Only a recorded successful outcome proves a step succeeded.
 
-        Status alone is insufficient: a reconcile fallback may leave a
-        step EXECUTED without an observable result, and such a step must
-        not unblock dependents.
+        Status alone is insufficient: a recovery fallback may leave a
+        step without an observable result, and such a step must not
+        unblock dependents. RECOVERY_REQUIRED can never satisfy
+        readiness: an unproven side effect is not a success.
         """
         result = step.result
         return (
@@ -260,6 +297,11 @@ class PlanService:
                 raise PlanStepNotFoundError("Plan step was not found")
             step = plan.steps[positions[step_id]]
 
+            if step.status is PlanStepStatus.RECOVERY_REQUIRED:
+                raise PlanStepStateError(
+                    "Plan step is uncertain and requires explicit "
+                    "recovery resolution first."
+                )
             if step.status is not PlanStepStatus.PENDING:
                 raise PlanStepStateError("Plan step is not pending.")
             satisfied = {
@@ -277,7 +319,12 @@ class PlanService:
             # mutating tools only create a pending approval here.
             try:
                 outcome = self._approvals.request_tool(
-                    step.tool_name, dict(step.arguments), owner_id, session_id
+                    step.tool_name,
+                    dict(step.arguments),
+                    owner_id,
+                    session_id,
+                    plan_id=plan_id,
+                    step_id=step_id,
                 )
             except ToolNotImplementedError:
                 # Registered metadata without an implementation must not
@@ -292,7 +339,7 @@ class PlanService:
                         "implementation."
                     ),
                 )
-                plan = self._record_result_locked(plan, step_id, failure)
+                plan = self._record_result_locked(plan, step_id, failure, owner_id, session_id)
                 logger.warning(
                     "Plan step failed: registered tool has no implementation",
                     extra={"extra_fields": {"tool_name": step.tool_name}},
@@ -300,7 +347,7 @@ class PlanService:
                 return failure
 
             if isinstance(outcome, ToolResult):
-                plan = self._record_result_locked(plan, step_id, outcome)
+                plan = self._record_result_locked(plan, step_id, outcome, owner_id, session_id)
                 return outcome
             if isinstance(outcome, ApprovalRequest):
                 plan = self._update_step(
@@ -310,6 +357,8 @@ class PlanService:
                         "status": PlanStepStatus.AWAITING_APPROVAL,
                         "approval_id": outcome.approval_id,
                     },
+                    owner_id,
+                    session_id,
                 )
                 return outcome
             raise PlanStepStateError("Unexpected approval workflow result.")
@@ -325,7 +374,7 @@ class PlanService:
         """Resolve one executed step with its authoritative ToolResult."""
         with self._lock:
             plan = self._owned_plan(plan_id, owner_id, session_id)
-            self._record_result_locked(plan, step_id, result)
+            self._record_result_locked(plan, step_id, result, owner_id, session_id)
 
     def resolve_approval_outcome(
         self,
@@ -344,38 +393,383 @@ class PlanService:
         silently ignored.
         """
         with self._lock:
-            for plan_id, identity in list(self._owners.items()):
-                if identity != (owner_id, session_id):
-                    continue
-                plan = self._plans.get(plan_id)
-                if plan is None:
-                    continue
-                match = next(
-                    (
-                        step
-                        for step in plan.steps
-                        if step.approval_id == approval_id
-                        and step.status is PlanStepStatus.AWAITING_APPROVAL
-                    ),
-                    None,
-                )
-                if match is None:
-                    continue
-                self._record_approval_result_locked(plan, match.step_id, result)
-                logger.info(
-                    "Recorded approval outcome on the owning plan step",
+            ref = self._db.find_step_ref_by_approval(
+                approval_id, owner_id, session_id
+            )
+            if ref is None:
+                # Approval belongs to no plan step (plain chat proposal).
+                return
+            plan_id, step_id = ref
+            plan = self._owned_plan(plan_id, owner_id, session_id)
+            self._record_approval_result_locked(plan, step_id, result, owner_id, session_id)
+            logger.info(
+                "Recorded approval outcome on the owning plan step",
+                extra={
+                    "extra_fields": {
+                        "tool_name": result.tool_name,
+                        "result_status": result.status,
+                    }
+                },
+            )
+
+    def resolve_step_uncertain(
+        self,
+        approval_id: str,
+        owner_id: str,
+        session_id: str,
+        result: ToolResult,
+    ) -> None:
+        """Move a mutating step with UNKNOWN outcome to RECOVERY_REQUIRED.
+
+        Registered as the approval service's uncertain listener for
+        mutating timeouts: the side effect can neither be proven present
+        nor absent, so the step must await explicit reconciliation
+        instead of being marked successful or failed. Steps already
+        resolved (e.g. by persisted evidence) keep their state and the
+        mismatch is logged.
+        """
+        with self._lock:
+            ref = self._db.find_step_ref_by_approval(
+                approval_id, owner_id, session_id
+            )
+            if ref is None:
+                # Uncertain outcome of a plain-chat proposal: no plan
+                # step to mark; the attempt row carries the evidence.
+                logger.warning(
+                    "Uncertain mutating outcome has no bound plan step",
                     extra={
                         "extra_fields": {
-                            "tool_name": result.tool_name,
-                            "result_status": result.status,
+                            "error_code": result.error_code,
                         }
                     },
                 )
                 return
-            # Approval belongs to no plan step (plain chat proposal).
+            plan_id, step_id = ref
+            plan = self._owned_plan(plan_id, owner_id, session_id)
+            positions = {step.step_id: i for i, step in enumerate(plan.steps)}
+            step = plan.steps[positions[step_id]]
+            if step.status is not PlanStepStatus.AWAITING_APPROVAL:
+                logger.warning(
+                    "Uncertain outcome ignored: step no longer awaits approval",
+                    extra={
+                        "extra_fields": {
+                            "step_status": step.status.value,
+                        }
+                    },
+                )
+                return
+            self._update_step(
+                plan,
+                step_id,
+                {
+                    "status": PlanStepStatus.RECOVERY_REQUIRED,
+                    "result": result.model_dump(),
+                },
+                owner_id,
+                session_id,
+            )
+            self._db.append_event(
+                EVENT_RECOVERY_REQUIRED,
+                detail={
+                    "plan_id": plan_id,
+                    "step_id": step_id,
+                    "approval_id": approval_id,
+                    "error_code": result.error_code,
+                },
+            )
+            logger.warning(
+                "Plan step marked RECOVERY_REQUIRED (uncertain mutation)",
+                extra={
+                    "extra_fields": {
+                        "result_status": result.status,
+                    }
+                },
+            )
+
+    def resolve_step_recovery(
+        self,
+        plan_id: str,
+        step_id: str,
+        owner_id: str,
+        session_id: str,
+    ) -> TaskPlan:
+        """Explicitly reconcile an uncertain step to an honest failure.
+
+        The only legal transition out of RECOVERY_REQUIRED. The outcome
+        stays unproven, so the step resolves FAILED with the
+        ``execution_uncertain`` classification and the mutation boundary
+        attempt is finalized RECONCILED; the user verifies the external
+        world and captures a new plan if needed.
+        """
+        with self._lock:
+            plan = self._owned_plan(plan_id, owner_id, session_id)
+            positions = {step.step_id: i for i, step in enumerate(plan.steps)}
+            if step_id not in positions:
+                raise PlanStepNotFoundError("Plan step was not found")
+            step = plan.steps[positions[step_id]]
+            if step.status is not PlanStepStatus.RECOVERY_REQUIRED:
+                raise PlanStepStateError(
+                    "Plan step does not require recovery reconciliation."
+                )
+            updated = self._update_step(
+                plan,
+                step_id,
+                {
+                    "status": PlanStepStatus.FAILED,
+                    "result": ToolResult.failure_result(
+                        tool_name=step.tool_name,
+                        error_code=ERROR_EXECUTION_UNCERTAIN,
+                        message=(
+                            "Execution outcome is uncertain; verify the "
+                            "external effect manually before retrying."
+                        ),
+                    ).model_dump(),
+                },
+                owner_id,
+                session_id,
+            )
+            if step.approval_id:
+                self._approvals.reconcile_uncertain(
+                    step.approval_id, owner_id, session_id
+                )
+            self._db.append_event(
+                EVENT_EXECUTION_RECONCILED,
+                detail={
+                    "plan_id": plan_id,
+                    "step_id": step_id,
+                },
+            )
+            logger.info(
+                "Plan step reconciled from RECOVERY_REQUIRED to FAILED",
+                extra={"extra_fields": {"result_status": "failure"}},
+            )
+            return self._copy(updated)
+
+    # -- persisted-evidence application (used by the recovery service) -----
+
+    def apply_persisted_outcome(
+        self,
+        plan_id: str,
+        step_id: str,
+        owner_id: str,
+        session_id: str,
+        result: ToolResult,
+    ) -> bool:
+        """Apply a proven ToolResult recorded before a crash.
+
+        Called by the recovery service for attempts whose outcome was
+        durably recorded but whose plan step never saw it. Success
+        resolves EXECUTED, failure resolves FAILED; no other state
+        changes and existing resolutions are never overwritten.
+        """
+        with self._lock:
+            plan = self._owned_plan(plan_id, owner_id, session_id)
+            positions = {step.step_id: i for i, step in enumerate(plan.steps)}
+            if step_id not in positions:
+                return False
+            step = plan.steps[positions[step_id]]
+            if step.status is not PlanStepStatus.AWAITING_APPROVAL:
+                return False
+            self._update_step(
+                plan,
+                step_id,
+                {
+                    "status": (
+                        PlanStepStatus.EXECUTED
+                        if result.success
+                        else PlanStepStatus.FAILED
+                    ),
+                    "result": result.model_dump(),
+                },
+                owner_id,
+                session_id,
+            )
+            self._db.append_event(
+                EVENT_RECOVERY_OUTCOME_APPLIED,
+                detail={
+                    "plan_id": plan_id,
+                    "step_id": step_id,
+                    "tool_name": result.tool_name,
+                },
+            )
+            return True
+
+    def mark_step_interrupted(
+        self,
+        plan_id: str,
+        step_id: str,
+        owner_id: str,
+        session_id: str,
+    ) -> bool:
+        """Resolve an approval-bound step that provably never started.
+
+        Reached when the process died after the claim but before the
+        tool invocation began: no tool side effect is possible, so the
+        honest terminal outcome is FAILED(execution_interrupted).
+        """
+        return self._mark_step_transition(
+            plan_id,
+            step_id,
+            owner_id,
+            session_id,
+            allowed_source={PlanStepStatus.AWAITING_APPROVAL},
+            target=PlanStepStatus.FAILED,
+            failure_result=ToolResult.failure_result(
+                tool_name=self._step_tool_name(plan_id, step_id, owner_id, session_id),
+                error_code=ERROR_EXECUTION_INTERRUPTED,
+                message=(
+                    "Execution was interrupted before the tool started; "
+                    "the action never took effect."
+                ),
+            ),
+        )
+
+    def mark_step_uncertain_from_recovery(
+        self,
+        plan_id: str,
+        step_id: str,
+        owner_id: str,
+        session_id: str,
+    ) -> bool:
+        """Move an approval-bound step to RECOVERY_REQUIRED on restore.
+
+        Reached when the process died after the tool invocation began
+        but before any outcome was recorded: the side effect is unknown,
+        so the step awaits explicit reconciliation. Returns whether the
+        transition happened; the caller (recovery service) owns the
+        lifecycle audit event, keeping rescans exactly idempotent.
+        """
+        return self._mark_step_transition(
+            plan_id,
+            step_id,
+            owner_id,
+            session_id,
+            allowed_source={PlanStepStatus.AWAITING_APPROVAL},
+            target=PlanStepStatus.RECOVERY_REQUIRED,
+            failure_result=None,
+        )
+
+    def mark_step_interrupted_read_only(
+        self,
+        plan_id: str,
+        step_id: str,
+        owner_id: str,
+        session_id: str,
+    ) -> bool:
+        """Resolve a crashed read-only step honestly (no uncertainty).
+
+        Read-only tools are provably side-effect free, so a crash after
+        their invocation started is an honest interrupted failure —
+        NEVER a recovery-required state. Applies to direct (non-approval)
+        executions whose step is still PENDING or awaiting approval.
+        """
+        return self._mark_step_transition(
+            plan_id,
+            step_id,
+            owner_id,
+            session_id,
+            allowed_source={PlanStepStatus.PENDING, PlanStepStatus.AWAITING_APPROVAL},
+            target=PlanStepStatus.FAILED,
+            failure_result=ToolResult.failure_result(
+                tool_name=(
+                    self._step_tool_name(plan_id, step_id, owner_id, session_id)
+                ),
+                error_code=ERROR_EXECUTION_INTERRUPTED,
+                message=(
+                    "Execution was interrupted before its outcome was "
+                    "recorded; no side effect was possible."
+                ),
+            ).model_dump(),
+        )
+
+    def _mark_step_transition(
+        self,
+        plan_id: str,
+        step_id: str,
+        owner_id: str,
+        session_id: str,
+        *,
+        allowed_source: set[PlanStepStatus],
+        target: PlanStepStatus,
+        failure_result: Optional[ToolResult],
+    ) -> bool:
+        """Apply one recovery transition if the step is still in source."""
+        with self._lock:
+            plan = self._owned_plan(plan_id, owner_id, session_id)
+            positions = {step.step_id: i for i, step in enumerate(plan.steps)}
+            if step_id not in positions:
+                return False
+            step = plan.steps[positions[step_id]]
+            if step.status not in allowed_source:
+                return False
+            updates: dict = {"status": target}
+            if failure_result is not None:
+                updates["result"] = failure_result.model_dump()
+            self._update_step(plan, step_id, updates, owner_id, session_id)
+            return True
+
+    def _step_tool_name(
+        self, plan_id: str, step_id: str, owner_id: str, session_id: str
+    ) -> str:
+        """Best-effort tool name for an interrupted failure result."""
+        try:
+            plan = self._owned_plan(plan_id, owner_id, session_id)
+            return (
+                next(
+                    (
+                        s.tool_name
+                        for s in plan.steps
+                        if s.step_id == step_id
+                    ),
+                    step_id,
+                )
+            )
+        except PlanNotFoundError:
+            return step_id
+
+    # -- internals -----------------------------------------------------
+
+    def _record_result_locked(
+        self,
+        plan: TaskPlan,
+        step_id: str,
+        result: ToolResult,
+        owner_id: str,
+        session_id: str,
+    ) -> TaskPlan:
+        """Apply the authoritative ToolResult to one step (lock held)."""
+        positions = {step.step_id: i for i, step in enumerate(plan.steps)}
+        if step_id not in positions:
+            raise PlanStepNotFoundError("Plan step was not found")
+        step = plan.steps[positions[step_id]]
+        allowed_states = {
+            PlanStepStatus.PENDING,
+            PlanStepStatus.AWAITING_APPROVAL,
+        }
+        if step.status not in allowed_states:
+            raise PlanStepStateError("Plan step already reached a final state.")
+
+        new_status = (
+            PlanStepStatus.COMPLETED if result.success else PlanStepStatus.FAILED
+        )
+        return self._update_step(
+            plan,
+            step_id,
+            {
+                "status": new_status,
+                "result": result.model_dump(),
+            },
+            owner_id,
+            session_id,
+        )
 
     def _record_approval_result_locked(
-        self, plan: TaskPlan, step_id: str, result: ToolResult
+        self,
+        plan: TaskPlan,
+        step_id: str,
+        result: ToolResult,
+        owner_id: str,
+        session_id: str,
     ) -> TaskPlan:
         """Apply an approved execution outcome exactly once (lock held).
 
@@ -400,38 +794,9 @@ class PlanService:
                 "status": new_status,
                 "result": result.model_dump(),
             },
+            owner_id,
+            session_id,
         )
-
-    # -- internals -----------------------------------------------------
-
-    def _record_result_locked(
-        self, plan: TaskPlan, step_id: str, result: ToolResult
-    ) -> TaskPlan:
-        """Apply the authoritative ToolResult to one step (lock held)."""
-        positions = {step.step_id: i for i, step in enumerate(plan.steps)}
-        if step_id not in positions:
-            raise PlanStepNotFoundError("Plan step was not found")
-        step = plan.steps[positions[step_id]]
-        allowed_states = {
-            PlanStepStatus.PENDING,
-            PlanStepStatus.AWAITING_APPROVAL,
-        }
-        if step.status not in allowed_states:
-            raise PlanStepStateError("Plan step already reached a final state.")
-
-        new_status = (
-            PlanStepStatus.COMPLETED if result.success else PlanStepStatus.FAILED
-        )
-        return self._update_step(
-            plan,
-            step_id,
-            {
-                "status": new_status,
-                "result": result.model_dump(),
-            },
-        )
-
-    # -- internals -----------------------------------------------------
 
     def _reconcile(
         self, plan: TaskPlan, owner_id: str, session_id: str
@@ -476,6 +841,8 @@ class PlanService:
                             ),
                         ).model_dump(),
                     },
+                    owner_id,
+                    session_id,
                 )
                 continue
             if approval.status is ApprovalStatus.EXECUTED:
@@ -503,6 +870,8 @@ class PlanService:
                             message="The proposed action was rejected.",
                         ).model_dump(),
                     },
+                    owner_id,
+                    session_id,
                 )
             elif approval.status is ApprovalStatus.EXPIRED:
                 plan = self._update_step(
@@ -516,18 +885,42 @@ class PlanService:
                             message="The proposed action expired without approval.",
                         ).model_dump(),
                     },
+                    owner_id,
+                    session_id,
                 )
         return plan
 
-    def _update_step(self, plan: TaskPlan, step_id: str, updates: dict) -> TaskPlan:
-        """Apply validated updates to one step, persist, and return the plan."""
+    def _update_step(
+        self,
+        plan: TaskPlan,
+        step_id: str,
+        updates: dict,
+        owner_id: str,
+        session_id: str,
+    ) -> TaskPlan:
+        """Apply validated updates to one step, persist, and return the plan.
+
+        Every status change is centrally validated against the plan-step
+        transition map before it is allowed to persist.
+        """
         dumps = plan.model_dump()
         for step_data in dumps["steps"]:
             if step_data["step_id"] == step_id:
+                new_status = updates.get("status")
+                if new_status is not None:
+                    try:
+                        validate_plan_step_transition(
+                            step_data["status"],
+                            new_status.value
+                            if hasattr(new_status, "value")
+                            else str(new_status),
+                        )
+                    except ExecutionLifecycleError as exc:
+                        raise PlanStepStateError(str(exc)) from exc
                 step_data.update(updates)
                 break
         updated = TaskPlan.model_validate(dumps)
-        self._store_plan(updated)
+        self._store_plan(updated, owner_id, session_id)
         return updated
 
 

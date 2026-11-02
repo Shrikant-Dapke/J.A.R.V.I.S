@@ -170,6 +170,38 @@ JARVIS/
 - Verification failure: do not report success.
 - Persistence failure: disclose history/memory save failure.
 
+### 8.1 Execution reliability (Phase 4.3)
+Every approved or policy-allowed execution runs inside a persisted,
+question-honest lifecycle (see section 10.5):
+
+- Tool executions carry a bounded wall-clock budget
+  (`TOOL_TIMEOUT_SECONDS`, 0.05–120) enforced at the execution
+  boundary, separate from provider timeouts. A timeout is NEVER
+  reported as "failed" (no side effect) or "succeeded": a mutating
+  tool's attempt is recorded `TIMED_OUT` with NO outcome and its plan
+  step becomes `RECOVERY_REQUIRED`; read-only tools are provably
+  side-effect free and their timeouts end as ordinary `FAILED`
+  executions with the recorded evidence.
+- Uncertain steps resolve ONLY through explicit human reconciliation
+  (`POST /api/plans/{plan_id}/steps/{step_id}/resolve-recovery`) to a
+  `FAILED` step classified `execution_uncertain`; the standing attempt
+  is finalized `RECONCILED`. There is no automatic retry: depends-on
+  chains stay blocked until a human decides.
+- A crash between the approval claim and the outcome is recovered at
+  startup (`run_startup_recovery`, idempotent): claimed-but-never-
+  started attempts resolve `FAILED(execution_interrupted)` (provably no
+  side effect); started attempts whose outcome was not recorded become
+  `RECOVERY_REQUIRED` (side effect unknown); durably recorded outcomes
+  the step never observed are applied verbatim.
+- Approval resolution is single-use and backend-enforced: the database
+  itself forbids a second open attempt per approval, so double
+  approval, replayed execution, and concurrent same-step claims are
+  impossible — including across processes.
+- Tool-layer failures are recorded as failed executions with fixed
+  safe messages; stack traces, exception internals, sensitive argument
+  values, and session identifiers never reach API responses or audit
+  rows.
+
 ## 9. Decisions to revisit
 Cloud provider/local model; backend process lifecycle; voice/wake-word; packaging and updates; memory retention/export; local API security mechanism.
 
@@ -260,8 +292,8 @@ Cloud provider/local model; backend process lifecycle; voice/wake-word; packagin
   desktop UI decides which step to request next.
 
 ### 10.4 Known limitations
-- The conversation, approval, and plan stores remain process-local
-  in-memory structures (same shared-storage caveat as section 5).
+- Conversations remain process-local in-memory structures (same
+  shared-storage caveat as section 5).
 - Unknown-tool proposals surface as 422 at proposal time rather than 404
   because registration is checked before anything executes.
 - Step arguments are `dict[str, str]`, matching the existing
@@ -274,6 +306,34 @@ Cloud provider/local model; backend process lifecycle; voice/wake-word; packagin
   on the audited policy/approval boundary, but a slow tool serializes
   callers of the same plan; offloading execution to bounded background
   workers is future performance work, not a correctness gap.
+
+### 10.5 Execution lifecycle and state (Phase 4.3)
+- All execution lifecycle state lives in one local SQLite database
+  (`backend/data/jarvis_state.db`, `JARVIS_STATE_DB_PATH` overridable):
+  plans and step states, approval records and their executed
+  outcomes, execution attempts, and a bounded audit trail. It uses
+  WAL + full synchronous commits, `BEGIN IMMEDIATE` transactions, and
+  `PRAGMA user_version` migrations; a schema newer than the
+  application fails closed at startup. It intentionally excludes
+  conversations (still process-local) and never contains secrets,
+  key material, or model instructions.
+- Developments pending here remain the conversation store and the
+  multi-step retry story; the execution lifecycle itself is durable.
+- Execution attempts are first-class rows with unique ids and a
+  central state machine: `CLAIMED → STARTED → SUCCEEDED | FAILED |
+  TIMED_OUT`, `CLAIMED → FAILED` (interrupted), `TIMED_OUT →
+  RECONCILED` only. Every transition is validated centrally;
+  terminal states absorb; a `TIMED_OUT` attempt carries NO outcome.
+- Plan-step states gained `RECOVERY_REQUIRED`: a mutating step whose
+  side effect could not be proven (crash after invocation started, or
+  a mutating timeout). It is non-terminal, never satisfies dependency
+  readiness, and resolves only via explicit reconciliation to
+  `FAILED(execution_uncertain)`.
+- Startup recovery is idempotent and honest: provable no-side-effect
+  crashes resolve interrupted; provable outcomes are replayed
+  verbatim; unknown outcomes require a human. Recovery counters are
+  logged and audited (`recovery_required`, `interrupted`,
+  `outcome_applied`, `errors`).
 
 ## Architecture principle
 **The model proposes; policy authorizes; tools execute; verification establishes the result.**

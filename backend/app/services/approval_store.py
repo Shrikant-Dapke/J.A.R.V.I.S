@@ -1,4 +1,30 @@
-"""Thread-safe in-memory approval store with TTL and single-use claims."""
+"""Persistent approval store with TTL, single-use claims, and retention.
+
+Phase 4.3: the store internals moved from process-local dictionaries to
+the SQLite execution-state façade, so approval records and their
+outcomes survive restarts and crashed mid-execution states remain
+inspectable. The public API and semantics of the previous in-memory
+store are preserved exactly:
+
+- PENDING / APPROVED requests lazily expire at their persisted absolute
+  ``expires_at``.
+- ``claim_approved_for_execution`` consumes APPROVED exactly once —
+  EXECUTED can never be reclaimed or replayed.
+- Terminal records are retained for a bounded window for audit, then
+  flagged purged; reads of purged records fail with
+  ``ApprovalNotFoundError`` (404 semantics) and purged rows no longer
+  occupy capacity.
+- Owner/session isolation: a foreign identity observes not-found, never
+  the record's state.
+- Returned objects are defensive copies; callers cannot mutate store
+  state through them.
+
+Secret hygiene: arguments are validated at the schema layer
+(secret-like keys and oversized values are rejected before this store
+ever sees them), and the persisted arguments are the integrity-verified
+exact values the user approved. Audit rows carry identifiers and
+classifications only.
+"""
 
 import hashlib
 import json
@@ -8,8 +34,21 @@ from threading import RLock
 from typing import Callable, Optional
 from uuid import uuid4
 
+from app.core.logging import get_logger
 from app.schemas.approval import ApprovalRequest, ApprovalStatus
 from app.schemas.policy import RiskLevel
+from app.services.execution_db import (
+    ApprovalRecord,
+    ExecutionStateDb,
+    state_db as shared_state_db,
+)
+from app.services.execution_lifecycle import (
+    EVENT_APPROVAL_CREATED,
+    EVENT_APPROVAL_EXPIRED,
+)
+
+
+logger = get_logger(__name__)
 
 
 DEFAULT_APPROVAL_TTL_SECONDS = 5 * 60
@@ -20,7 +59,7 @@ DEFAULT_SESSION_ID = "internal-session"
 
 
 class ApprovalNotFoundError(LookupError):
-    """Raised when an approval identifier is unknown."""
+    """Raised when an approval identifier is unknown (or was purged)."""
 
 
 class ApprovalStateError(ValueError):
@@ -28,7 +67,7 @@ class ApprovalStateError(ValueError):
 
 
 class ApprovalCapacityError(RuntimeError):
-    """Raised when bounded in-memory approval capacity is exhausted."""
+    """Raised when the bounded approval store capacity is exhausted."""
 
 
 class ApprovalStore:
@@ -40,6 +79,7 @@ class ApprovalStore:
         clock: Optional[Callable[[], datetime]] = None,
         max_entries: int = DEFAULT_MAX_APPROVAL_ENTRIES,
         terminal_retention_seconds: int = DEFAULT_TERMINAL_RETENTION_SECONDS,
+        state_db: Optional[ExecutionStateDb] = None,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError("ttl_seconds must be positive")
@@ -51,10 +91,15 @@ class ApprovalStore:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_entries = max_entries
         self._terminal_retention = timedelta(seconds=terminal_retention_seconds)
-        self._requests: dict[str, ApprovalRequest] = {}
-        self._owners: dict[str, tuple[str, str]] = {}
-        self._argument_digests: dict[str, str] = {}
+        # No explicit façade => an isolated in-memory database for this
+        # store (test object graphs stay independent by construction).
+        self._db = state_db if state_db is not None else ExecutionStateDb()
         self._lock = RLock()
+
+    @property
+    def execution_db(self) -> ExecutionStateDb:
+        """The façade backing this store (attempts share its connection)."""
+        return self._db
 
     def _now(self) -> datetime:
         """Return a timezone-aware UTC timestamp from the injected clock."""
@@ -79,16 +124,30 @@ class ApprovalStore:
         values["resolved_at"] = resolved_at
         return ApprovalRequest(**values)
 
+    # -- persistence helpers ---------------------------------------------
+
     def _cleanup(self, now: datetime) -> None:
-        """Expire stale requests and remove old terminal records."""
-        for approval_id, request in list(self._requests.items()):
+        """Expire stale requests and purge old terminal records (persisted).
+
+        Terminal rows are flagged purged for the audit trail rather than
+        deleted; reads treat them as unknown afterwards and capacity
+        counts no longer include them.
+        """
+        for record in self._db.list_approval_records(include_purged=False):
+            request = record.request
             if (
                 request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}
                 and now >= request.expires_at
             ):
-                request = self._with_status(request, ApprovalStatus.EXPIRED, now)
-                self._requests[approval_id] = request
-
+                expired = self._with_status(request, ApprovalStatus.EXPIRED, now)
+                self._db.save_approval(
+                    expired, record.owner_id, record.session_id, record.digest
+                )
+                self._db.append_event(
+                    EVENT_APPROVAL_EXPIRED,
+                    detail={"approval_id": record.approval_id, "reason": "ttl"},
+                )
+                request = expired
             if (
                 request.status
                 in {
@@ -99,9 +158,7 @@ class ApprovalStore:
                 and request.resolved_at is not None
                 and now >= request.resolved_at + self._terminal_retention
             ):
-                self._requests.pop(approval_id, None)
-                self._owners.pop(approval_id, None)
-                self._argument_digests.pop(approval_id, None)
+                self._db.mark_approval_purged(record.approval_id)
 
     @staticmethod
     def _arguments_digest(arguments: dict[str, str]) -> str:
@@ -111,35 +168,46 @@ class ApprovalStore:
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def _owned_request(
-        self, approval_id: str, owner_id: str, session_id: str
-    ) -> ApprovalRequest:
-        request = self._requests.get(approval_id)
-        identity = self._owners.get(approval_id)
-        if request is None or identity != (owner_id, session_id):
-            raise ApprovalNotFoundError("Approval request was not found")
-        return request
-
-    def _expire_if_needed(self, approval_id: str) -> ApprovalRequest:
-        request = self._requests.get(approval_id)
-        if request is None:
-            raise ApprovalNotFoundError("Approval request was not found")
-        if (
-            request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}
-            and self._now() >= request.expires_at
-        ):
-            request = self._with_status(
-                request, ApprovalStatus.EXPIRED, self._now()
-            )
-            self._requests[approval_id] = request
-        return request
-
     def _expire_if_needed_for_owner(
         self, approval_id: str, owner_id: str, session_id: str
     ) -> ApprovalRequest:
-        """Authorize access before applying lazy expiration."""
-        self._owned_request(approval_id, owner_id, session_id)
-        return self._expire_if_needed(approval_id)
+        """Authorize access, then apply persisted lazy expiration."""
+        with self._lock:
+            record = self._owned_record(approval_id, owner_id, session_id)
+            request = record.request
+            if (
+                request.status in {ApprovalStatus.PENDING, ApprovalStatus.APPROVED}
+                and self._now() >= request.expires_at
+            ):
+                expired = self._with_status(
+                    request,
+                    ApprovalStatus.EXPIRED,
+                    self._now(),
+                )
+                self._db.save_approval(
+                    expired, record.owner_id, record.session_id, record.digest
+                )
+                self._db.append_event(
+                    EVENT_APPROVAL_EXPIRED,
+                    detail={"approval_id": approval_id, "reason": "ttl"},
+                )
+                request = expired
+            return request
+
+    def _owned_record(
+        self, approval_id: str, owner_id: str, session_id: str
+    ) -> ApprovalRecord:
+        record = self._db.get_approval_record(approval_id)
+        if (
+            record is None
+            or record.purged
+            or record.owner_id != owner_id
+            or record.session_id != session_id
+        ):
+            raise ApprovalNotFoundError("Approval request was not found")
+        return record
+
+    # -- public API (unchanged shapes) ------------------------------------
 
     def create_approval_request(
         self,
@@ -154,7 +222,7 @@ class ApprovalStore:
         with self._lock:
             created_at = self._now()
             self._cleanup(created_at)
-            if len(self._requests) >= self._max_entries:
+            if self._db.count_active_approvals() >= self._max_entries:
                 raise ApprovalCapacityError(
                     "The approval store has reached its configured capacity."
                 )
@@ -167,10 +235,19 @@ class ApprovalStore:
                 created_at=created_at,
                 expires_at=created_at + timedelta(seconds=self._ttl_seconds),
             )
-            self._requests[request.approval_id] = request
-            self._owners[request.approval_id] = (owner_id, session_id)
-            self._argument_digests[request.approval_id] = self._arguments_digest(
-                request.arguments
+            self._db.save_approval(
+                request,
+                owner_id,
+                session_id,
+                self._arguments_digest(request.arguments),
+            )
+            self._db.append_event(
+                EVENT_APPROVAL_CREATED,
+                detail={
+                    "approval_id": request.approval_id,
+                    "tool_name": request.tool_name,
+                    "risk_level": request.risk_level.value,
+                },
             )
             return self._copy(request)
 
@@ -203,9 +280,30 @@ class ApprovalStore:
                 raise ApprovalStateError(
                     "Approval request is not pending."
                 )
-            request = self._with_status(request, ApprovalStatus.APPROVED, None)
-            self._requests[approval_id] = request
-            return self._copy(request)
+            approved = self._with_status(request, ApprovalStatus.APPROVED, None)
+            record = self._owned_record(approval_id, owner_id, session_id)
+            self._db.save_approval(
+                approved, record.owner_id, record.session_id, record.digest
+            )
+            return self._copy(approved)
+
+    def seed_stored_request(
+        self,
+        request: ApprovalRequest,
+        owner_id: str = DEFAULT_OWNER_ID,
+        session_id: str = DEFAULT_SESSION_ID,
+    ) -> None:
+        """Persist an operator-provided record, replacing the payload.
+
+        Simulation hook (tests only). The identity and the creation-time
+        integrity digest are left untouched, exactly like a tampering or
+        policy-drift event would leave them: the record's payload
+        changes while the stored evidence no longer matches it.
+        """
+        record = self._db.get_approval_record(request.approval_id)
+        if record is None:
+            raise ApprovalNotFoundError("Approval request was not found")
+        self._db.save_approval(request, record.owner_id, record.session_id, record.digest)
 
     def arguments_match_original(
         self,
@@ -218,9 +316,12 @@ class ApprovalStore:
         with self._lock:
             self._cleanup(self._now())
             self._expire_if_needed_for_owner(approval_id, owner_id, session_id)
-            expected = self._argument_digests.get(approval_id)
+            record = self._owned_record(approval_id, owner_id, session_id)
+            expected = record.digest
             actual = self._arguments_digest(arguments)
-            return expected is not None and secrets.compare_digest(expected, actual)
+            return expected is not None and secrets.compare_digest(
+                expected, actual
+            )
 
     def reject_request(
         self,
@@ -231,16 +332,19 @@ class ApprovalStore:
         """Move exactly one pending request to REJECTED."""
         with self._lock:
             self._cleanup(self._now())
+            record = self._owned_record(approval_id, owner_id, session_id)
             request = self._expire_if_needed_for_owner(
                 approval_id, owner_id, session_id
             )
             if request.status is not ApprovalStatus.PENDING:
                 raise ApprovalStateError("Approval request is not pending.")
-            request = self._with_status(
+            rejected = self._with_status(
                 request, ApprovalStatus.REJECTED, self._now()
             )
-            self._requests[approval_id] = request
-            return self._copy(request)
+            self._db.save_approval(
+                rejected, record.owner_id, record.session_id, record.digest
+            )
+            return self._copy(rejected)
 
     def expire_request(
         self,
@@ -251,6 +355,7 @@ class ApprovalStore:
         """Explicitly expire a pending request, primarily for lifecycle control."""
         with self._lock:
             self._cleanup(self._now())
+            record = self._owned_record(approval_id, owner_id, session_id)
             request = self._expire_if_needed_for_owner(
                 approval_id, owner_id, session_id
             )
@@ -258,9 +363,13 @@ class ApprovalStore:
                 return self._copy(request)
             if request.status is not ApprovalStatus.PENDING:
                 raise ApprovalStateError("Approval request is not pending.")
-            request = self._with_status(request, ApprovalStatus.EXPIRED, self._now())
-            self._requests[approval_id] = request
-            return self._copy(request)
+            expired = self._with_status(
+                request, ApprovalStatus.EXPIRED, self._now()
+            )
+            self._db.save_approval(
+                expired, record.owner_id, record.session_id, record.digest
+            )
+            return self._copy(expired)
 
     def claim_approved_for_execution(
         self,
@@ -271,14 +380,19 @@ class ApprovalStore:
         """Atomically consume APPROVED and prevent all future replays."""
         with self._lock:
             self._cleanup(self._now())
+            record = self._owned_record(approval_id, owner_id, session_id)
             request = self._expire_if_needed_for_owner(
                 approval_id, owner_id, session_id
             )
             if request.status is not ApprovalStatus.APPROVED:
                 raise ApprovalStateError("Approval request is not approved.")
-            request = self._with_status(request, ApprovalStatus.EXECUTED, self._now())
-            self._requests[approval_id] = request
-            return self._copy(request)
+            consumed = self._with_status(
+                request, ApprovalStatus.EXECUTED, self._now()
+            )
+            self._db.save_approval(
+                consumed, record.owner_id, record.session_id, record.digest
+            )
+            return self._copy(consumed)
 
 
-approval_store = ApprovalStore()
+approval_store = ApprovalStore(state_db=shared_state_db)

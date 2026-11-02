@@ -4,7 +4,28 @@ This autouse fixture pins FakeProvider for every test, so a developer's
 local .env (e.g. LLM_PROVIDER=gemini with a real key) can NEVER cause
 ordinary tests to make network calls. Tests that need another provider
 set an explicit override on top of this guard.
+
+Phase 4.3 execution-state isolation: the shared file-backed execution
+database is redirected into a fresh temporary directory for this pytest
+process, so service-level singletons never touch the developer's data
+directory and every test run starts from clean persisted state.
 """
+
+import atexit
+import os
+import shutil
+import tempfile
+
+# The path must be set BEFORE any app module is imported: pydantic
+# settings read the environment when app.core.config is first imported.
+_TEST_STATE_DIR = tempfile.mkdtemp(prefix="jarvis-state-test-")
+os.environ["JARVIS_STATE_DB_PATH"] = os.path.join(
+    _TEST_STATE_DIR, "jarvis_state.db"
+)
+
+atexit.register(
+    lambda: shutil.rmtree(_TEST_STATE_DIR, ignore_errors=True)
+)
 
 import pytest
 from pydantic import SecretStr

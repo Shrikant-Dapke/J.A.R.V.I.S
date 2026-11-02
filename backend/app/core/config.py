@@ -16,6 +16,11 @@ OLLAMA_MODEL_NAME_RE = re.compile(
 OLLAMA_TIMEOUT_BOUNDS = (1.0, 600.0)
 OLLAMA_NUM_CTX_BOUNDS = (256, 32768)
 
+# Tool execution timeout bounds (Phase 4.3): tiny floor keeps tests
+# deterministic with injected budgets; the ceiling keeps a stuck tool
+# from blocking an interactive session indefinitely.
+TOOL_TIMEOUT_BOUNDS = (0.05, 120.0)
+
 
 def validate_loopback_http_url(url: str) -> str:
     """
@@ -90,6 +95,25 @@ class Settings(BaseSettings):
         default=None,
         description="Optional absolute path to the trusted VS Code executable",
         validation_alias=AliasChoices("JARVIS_CODE_EXECUTABLE", "CODE_EXECUTABLE_PATH"),
+    )
+
+    # Execution reliability (Phase 4.3). A single local SQLite file keeps
+    # plans, approvals, attempts, and audit events durable across
+    # restarts; leaving it unset uses backend/data/jarvis_state.db.
+    state_db_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "SQLite file for execution lifecycle state "
+            "(default backend/data/jarvis_state.db; never contains secrets)"
+        ),
+        validation_alias=AliasChoices("JARVIS_STATE_DB_PATH", "STATE_DB_PATH"),
+    )
+    # Bounded wall-clock budget for one tool execution. This is separate
+    # from provider timeouts: a mutating tool that times out must be
+    # treated as uncertain, never as "no side effect".
+    tool_timeout_seconds: float = Field(
+        default=20.0,
+        description="Bounded wall-clock budget for a single tool execution",
     )
 
     # Logging
@@ -240,6 +264,18 @@ class Settings(BaseSettings):
         if not low <= timeout <= high:
             raise ValueError(
                 f"ollama_timeout_seconds must be between {low} and {high}"
+            )
+        return timeout
+
+    @field_validator("tool_timeout_seconds")
+    @classmethod
+    def validate_tool_timeout_seconds(cls, v: float) -> float:
+        """Accept only bounded tool execution budgets."""
+        low, high = TOOL_TIMEOUT_BOUNDS
+        timeout = float(v)
+        if not low <= timeout <= high:
+            raise ValueError(
+                f"tool_timeout_seconds must be between {low} and {high}"
             )
         return timeout
 

@@ -139,6 +139,49 @@ unavailable tool). A failed, rejected, or expired step cannot be
 re-requested — address the cause and capture a new plan with a new
 chat turn instead.
 
+### Execution reliability (Milestone 4.3)
+
+Plans, plan-step states, approval records and their executed outcomes,
+execution attempts, and a bounded audit trail now persist in one local
+SQLite file (`JARVIS_STATE_DB_PATH`, default `backend/data/jarvis_state.db`,
+gitignored) using WAL + full synchronous commits and `BEGIN IMMEDIATE`
+transactions. The database never contains secrets, key material, or
+model instructions, and conversations intentionally remain
+process-local.
+
+The execution workflow is now crash-honest end to end:
+
+- Every execution gets a unique persisted **attempt** (`CLAIMED →
+  STARTED → SUCCEEDED | FAILED | TIMED_OUT`; `TIMED_OUT → RECONCILED`
+  only). The mutation boundary (`STARTED`) is persisted *before* the
+  tool is invoked, so a crash anywhere leaves supporting evidence
+  behind.
+- A database-level partial unique index permits **at most one open
+  attempt per approval**, which makes duplicate execution, replayed
+  approvals, and concurrent same-step claims impossible — even across
+  processes.
+- Tool invocations run under a bounded wall-clock budget
+  (`TOOL_TIMEOUT_SECONDS`, 0.05–120 s), separate from provider
+  timeouts. Because nothing can prove the absence of a side effect
+  after a mutating timeout, the attempt is recorded `TIMED_OUT` with
+  **no outcome** and the step becomes **`RECOVERY_REQUIRED`** — an
+  explicit new non-terminal state that resolves only through human
+  reconciliation:
+
+  ```text
+  POST /api/plans/{plan_id}/steps/{step_id}/resolve-recovery
+  ```
+
+  which resolves the step `FAILED(execution_uncertain)` and finalizes
+  the attempt `RECONCILED`, exactly once. Read-only tools are provably
+  side-effect free: their timeouts are ordinary `FAILED` executions.
+- On startup, `run_startup_recovery` classifies interrupted state
+  honestly and idempotently: claimed-but-never-started attempts resolve
+  `FAILED(execution_interrupted)` (provably no side effect); started
+  attempts without a recorded outcome become `RECOVERY_REQUIRED`;
+  durably recorded outcomes the step never observed are applied
+  verbatim. Nothing is auto-retried, nothing is hidden.
+
 ## LLM Providers
 
 Three interchangeable providers live behind `backend/app/services/llm/`. The
@@ -231,10 +274,14 @@ point, not a proven optimum.
 | Slow responses | low VRAM, CPU offload | Lower `OLLAMA_NUM_CTX` (e.g. 2048) and retest; keep the backend on loopback |
 
 ## Status
-**Phase 4 — Intelligent Orchestration (Milestones 4.1–4.2)**
+**Phase 4 — Intelligent Orchestration (Milestones 4.1–4.3)**
 The Main Orchestrator routes chat turns through reply / tool-action /
 task-plan decisions, captures bounded validated task plans, and executes
 steps only one at a time through the existing policy and approval
-workflow. Backend foundation, LLM providers (fake / gemini / ollama),
-and the policy–approval–execution stack are complete and covered by the
-test suite.
+workflow. Milestone 4.3 adds durable execution state (SQLite), a
+validated attempt/step lifecycle, single-use backend-enforced
+idempotency, bounded tool timeouts with honest uncertain-outcome
+handling (`RECOVERY_REQUIRED` + explicit reconciliation), and idempotent
+startup recovery. Backend foundation, LLM providers (fake / gemini /
+ollama), and the policy–approval–execution stack are complete and
+covered by the test suite.

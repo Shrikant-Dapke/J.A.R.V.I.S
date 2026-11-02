@@ -113,3 +113,40 @@ async def request_plan_step(
             content=outcome.model_dump(mode="json"),
         )
     return outcome
+
+
+@router.post(
+    "/api/plans/{plan_id}/steps/{step_id}/resolve-recovery",
+    response_model=TaskPlan,
+    status_code=200,
+)
+async def resolve_plan_step_recovery(
+    plan_id: str,
+    step_id: str,
+    principal: AuthenticatedSession = Depends(require_authenticated_session),
+    _origin: None = Depends(require_safe_origin),
+) -> TaskPlan:
+    """Explicitly reconcile a RECOVERY_REQUIRED step.
+
+    Approval-driven automatic execution never resolves uncertain steps:
+    whether the side effect occurred cannot be proven by the backend, so
+    a human acknowledges the uncertainty here. The step resolves FAILED
+    with an ``execution_uncertain`` classification and the standing
+    mutation boundary attempt is finalized RECONCILED. The user must
+    verify any external effect manually; dependents stay blocked either
+    way until a new plan captures the follow-up work.
+    """
+    try:
+        return plan_service.resolve_step_recovery(
+            plan_id, step_id, principal.owner_id, principal.session_id
+        )
+    except (PlanNotFoundError, PlanStepNotFoundError) as exc:
+        raise StarletteHTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        )
+    except PlanStepStateError as exc:
+        raise StarletteHTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        )

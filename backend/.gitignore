@@ -55,3 +55,7 @@ logs/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Local execution-state database (Phase 4.3): plans, approval records,
+# execution attempts, and audit events. Runtime data — never commit.
+data/

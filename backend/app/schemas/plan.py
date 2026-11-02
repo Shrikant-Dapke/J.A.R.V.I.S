@@ -48,10 +48,20 @@ class PlanStepStatus(str, Enum):
     outcome and always carries its recorded result. Only recorded
     outcomes count for dependency readiness — status alone never proves
     success.
+
+    RECOVERY_REQUIRED marks a mutating step whose outcome could not be
+    proven (e.g. the process died after the tool started, or a mutating
+    execution exceeded its time budget). It is deliberately NOT
+    terminal: whether the side effect occurred is unknown, so automatic
+    reporting of success or failure would be dishonest. It resolves only
+    through explicit reconciliation (resolve-recovery endpoint) to a
+    FAILED step with an ``execution_uncertain`` result, and it can never
+    satisfy dependency readiness.
     """
 
     PENDING = "PENDING"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
     COMPLETED = "COMPLETED"
     EXECUTED = "EXECUTED"
     FAILED = "FAILED"

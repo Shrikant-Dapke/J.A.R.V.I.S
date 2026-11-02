@@ -21,6 +21,9 @@ from app.api.plans import router as plans_router
 from app.core.config import settings
 from app.core.logging import setup_logging, get_logger
 from app.core.security import allowed_origins, is_loopback_host
+from app.services.approval_service import approval_service
+from app.services.plan_service import plan_service
+from app.services.recovery_service import run_startup_recovery
 
 
 logger = get_logger(__name__)
@@ -37,6 +40,24 @@ async def lifespan(app: FastAPI):
     # Startup
     setup_logging()
     logger.info("Application starting", extra={"extra_fields": {"app_name": settings.app_name, "version": settings.app_version}})
+    # Recover interrupted execution state from the last run before the
+    # API starts accepting requests. Idempotent and defensive: honest
+    # interrupted/uncertain states are restored, nothing is re-executed.
+    try:
+        recovery_counts = run_startup_recovery(
+            plan_service=plan_service,
+            approval_service=approval_service,
+        )
+    except Exception as exc:  # recovery is defensive by design
+        logger.error(
+            "Startup recovery failed",
+            extra={"extra_fields": {"error_type": type(exc).__name__}},
+        )
+    else:
+        logger.info(
+            "Execution state recovery finished",
+            extra={"extra_fields": dict(recovery_counts)},
+        )
     yield
     # Shutdown
     logger.info("Application shutting down")

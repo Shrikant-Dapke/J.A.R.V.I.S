@@ -206,11 +206,13 @@ def test_secret_like_arguments_are_not_stored():
 def test_approval_policy_is_rechecked_before_execution():
     service, store = _service()
     request = service.request_tool("open_application", {"app_id": "notepad"})
-    store._requests[request.approval_id] = ApprovalRequest(
-        **{
-            **store.get_approval_request(request.approval_id).model_dump(),
-            "risk_level": RiskLevel.HIGH_RISK,
-        }
+    store.seed_stored_request(
+        ApprovalRequest(
+            **{
+                **store.get_approval_request(request.approval_id).model_dump(),
+                "risk_level": RiskLevel.HIGH_RISK,
+            }
+        )
     )
 
     with pytest.raises(ApprovalPolicyError):
@@ -417,11 +419,13 @@ def test_tampered_stored_arguments_never_reach_executor(monkeypatch):
     monkeypatch.setattr(service._executor, "execute", execute)
     request = service.request_tool("open_application", {"app_id": "notepad"})
     stored = store.get_approval_request(request.approval_id)
-    store._requests[request.approval_id] = ApprovalRequest(
-        **{
-            **stored.model_dump(),
-            "arguments": {"app_id": "powershell"},
-        }
+    store.seed_stored_request(
+        ApprovalRequest(
+            **{
+                **stored.model_dump(),
+                "arguments": {"app_id": "powershell"},
+            }
+        )
     )
 
     with pytest.raises(ApprovalIntegrityError):
