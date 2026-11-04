@@ -104,7 +104,7 @@ def test_file_schema_is_created_and_versioned(tmp_path):
     path = str(tmp_path / "state.db")
     db = ExecutionStateDb(path=path)
     row = db._conn.execute("PRAGMA user_version").fetchone()
-    assert int(row[0]) == 1
+    assert int(row[0]) == 2
     names = {
         r["name"]
         for r in db._conn.execute(
@@ -114,11 +114,12 @@ def test_file_schema_is_created_and_versioned(tmp_path):
     assert {
         "plans", "plan_steps", "approval_requests",
         "execution_attempts", "execution_events",
+        "conversations", "conversation_messages",
     } <= names
     db.close()
-    # Reopening stays on version 1 without recreating anything.
+    # Reopening stays on version 2 without recreating anything.
     db2 = ExecutionStateDb(path=path)
-    assert int(db2._conn.execute("PRAGMA user_version").fetchone()[0]) == 1
+    assert int(db2._conn.execute("PRAGMA user_version").fetchone()[0]) == 2
     db2.close()
 
 
@@ -189,7 +190,7 @@ def test_plan_count_is_global_for_bounded_capacity():
 def test_attempt_open_unique_per_approval_is_backend_idempotency():
     db = ExecutionStateDb()
     approval = _approval()
-    db.save_approval(approval, "owner-a", "sess-a", "digest")
+    db.insert_approval(approval, "owner-a", "sess-a", "digest")
     first = str(uuid4())
 
     db.create_attempt(
@@ -246,7 +247,7 @@ def test_outcome_bindings_join_proven_outcomes_only():
     db = ExecutionStateDb()
     approval = _approval(status=ApprovalStatus.EXECUTED,
                          resolved_at=datetime.now(timezone.utc))
-    db.save_approval(approval, "owner-a", "sess-a", "digest")
+    db.insert_approval(approval, "owner-a", "sess-a", "digest")
     step_plan = _plan(step_status=PlanStepStatus.AWAITING_APPROVAL,
                       approval_id=approval.approval_id)
     db.save_plan(step_plan, "owner-a", "sess-a")
@@ -279,7 +280,7 @@ def test_outcome_bindings_join_proven_outcomes_only():
 def test_approval_save_get_and_digest_round_trip():
     db = ExecutionStateDb()
     approval = _approval()
-    db.save_approval(approval, "owner-a", "sess-a", "digest-original")
+    db.insert_approval(approval, "owner-a", "sess-a", "digest-original")
     record = db.get_approval_record(approval.approval_id)
     assert record.request.status is ApprovalStatus.PENDING
     assert record.digest == "digest-original"
@@ -290,7 +291,9 @@ def test_approval_save_get_and_digest_round_trip():
         update={"status": ApprovalStatus.EXECUTED,
                 "resolved_at": datetime.now(timezone.utc)}
     )
-    db.save_approval(terminal, "owner-a", "sess-a", "digest-original")
+    db.save_approval(
+        terminal, approval.approval_id, "owner-a", "sess-a", "digest-original"
+    )
     updated = db.get_approval_record(approval.approval_id)
     assert updated.request.status is ApprovalStatus.EXECUTED
     assert updated.digest == "digest-original"
@@ -299,9 +302,11 @@ def test_approval_save_get_and_digest_round_trip():
 def test_approval_purge_flags_rows_without_deleting_them():
     db = ExecutionStateDb()
     approval = _approval()
-    db.save_approval(approval, "owner-a", "sess-a", "digest")
+    db.insert_approval(approval, "owner-a", "sess-a", "digest")
     assert db.count_active_approvals() == 1
-    assert db.mark_approval_purged(approval.approval_id) is True
+    assert db.mark_approval_purged(
+        approval.approval_id, "owner-a", "sess-a"
+    ) is True
     record = db.get_approval_record(approval.approval_id)
     assert record.purged is True          # audit row remains
     assert db.count_active_approvals() == 0  # capacity excludes it
@@ -334,7 +339,7 @@ def test_file_backed_state_survives_close_and_reopen(tmp_path):
     approval = _approval()
     db = ExecutionStateDb(path=path)
     db.save_plan(plan, "owner-a", "sess-a")
-    db.save_approval(approval, "owner-a", "sess-a", "digest")
+    db.insert_approval(approval, "owner-a", "sess-a", "digest")
     attempt_id = str(uuid4())
     db.create_attempt(
         attempt_id=attempt_id, approval_id=approval.approval_id, owner_id="owner-a",

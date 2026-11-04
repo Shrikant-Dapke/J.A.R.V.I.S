@@ -39,6 +39,10 @@ def get_chat_response(
     Raises:
         ConversationNotFoundError: If the conversation exists but is
             bound to a different owner or session.
+        ConversationCapacityError: When this identity's conversation
+            store is exhausted (mapped to HTTP 503; nothing is stored).
+        ConversationCorruptError: When persisted history cannot be
+            validated (mapped to HTTP 500).
         LLMError: On provider configuration, API, timeout, or
             invalid-response failures (mapped to HTTP by the route).
         OrchestrationInvalidProposalError: When the model returns a

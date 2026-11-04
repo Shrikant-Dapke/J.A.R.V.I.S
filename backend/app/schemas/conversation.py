@@ -1,4 +1,4 @@
-"""Conversation context schemas (temporary in-memory state, not permanent memory)."""
+"""Conversation context schemas (persistent history, Phase 5.1)."""
 
 from datetime import datetime, timezone
 from typing import Literal
@@ -22,7 +22,37 @@ class ConversationHistoryResponse(BaseModel):
 
     conversation_id: str = Field(description="Conversation identifier")
     turns: list[ConversationTurn] = Field(description="Chronological turns")
-    turn_count: int = Field(description="Total number of turns")
+    turn_count: int = Field(
+        description="Number of turns in THIS response (windowed views "
+        "may be smaller than the stored total)"
+    )
+    total_turn_count: int = Field(
+        description="Total turns persisted for the conversation"
+    )
+
+
+class ConversationSummary(BaseModel):
+    """One conversation's metadata (never message content)."""
+
+    conversation_id: str = Field(description="Conversation identifier")
+    created_at: datetime = Field(description="Creation timestamp (UTC)")
+    updated_at: datetime = Field(
+        description="Timestamp of the last stored turn (UTC)"
+    )
+    turn_count: int = Field(description="Total turns stored")
+
+
+class ConversationListResponse(BaseModel):
+    """Metadata page for the authenticated identity's conversations."""
+
+    conversations: list[ConversationSummary] = Field(
+        description="Conversations ordered by most recent activity"
+    )
+    total: int = Field(
+        description="Total conversations for the authenticated identity"
+    )
+    limit: int = Field(description="Page size actually applied")
+    offset: int = Field(description="Offset actually applied")
 
 
 class ConversationClearResponse(BaseModel):

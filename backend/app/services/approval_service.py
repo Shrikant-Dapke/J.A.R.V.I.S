@@ -24,12 +24,17 @@ from typing import Any, Callable, Mapping, Optional, Union
 from uuid import uuid4
 
 from app.core.logging import get_logger
-from app.schemas.approval import ApprovalRequest, ApprovalStatus
+from app.schemas.approval import (
+    MAX_ACTION_DESCRIPTION_LENGTH,
+    ApprovalRequest,
+    ApprovalStatus,
+)
 from app.schemas.policy import PolicyDecision
 from app.schemas.tool import ToolResult
 from app.services.approval_store import (
     DEFAULT_OWNER_ID,
     DEFAULT_SESSION_ID,
+    ApprovalCorruptError,
     ApprovalStore,
     approval_store,
 )
@@ -177,16 +182,16 @@ class ApprovalService:
             )
 
     @staticmethod
-    def _action_description(
-        tool_name: str, description: str, arguments: Mapping[str, Any]
-    ) -> str:
-        """Build a bounded description from already validated arguments."""
-        if not arguments:
-            return f"{tool_name}: {description}"
-        rendered = ", ".join(
-            f"{key}={value}" for key, value in sorted(arguments.items())
-        )
-        return f"{tool_name}: {description} ({rendered})"[:512]
+    def _action_description(tool_name: str, description: str) -> str:
+        """Build a bounded description from trusted static metadata only.
+
+        Phase 5.3: ``action_description`` carries the registered tool
+        identity and its static registry description — never argument
+        values — because this string reaches approval inventory
+        summaries and chat responses. Exact arguments remain available
+        through the authorized approval detail path alone.
+        """
+        return f"{tool_name}: {description}"[:MAX_ACTION_DESCRIPTION_LENGTH]
 
     def _decision(self, tool_name: str) -> PolicyDecision:
         return evaluate_tool_policy(tool_name, registry=self._registry)
@@ -253,7 +258,7 @@ class ApprovalService:
             tool_name=tool_name,
             arguments={key: str(value) for key, value in normalized.items()},
             action_description=self._action_description(
-                tool_name, definition.description, normalized
+                tool_name, definition.description
             ),
             risk_level=decision.risk_level,
             owner_id=owner_id,
@@ -377,8 +382,55 @@ class ApprovalService:
         owner_id: str = DEFAULT_OWNER_ID,
         session_id: str = DEFAULT_SESSION_ID,
     ) -> ApprovalRequest:
-        """Return approval state with lazy expiration applied."""
-        return self._store.get_approval_request(approval_id, owner_id, session_id)
+        """Return approval state with lazy expiration applied.
+
+        Fail closed (Phase 5.2-c): a raw parse failure anywhere in this
+        read — including the maintenance scan the store runs before its
+        identity gate — is surfaced as ``ApprovalCorruptError`` with a
+        fixed, non-sensitive message. The scan's parsing semantics are
+        deliberately unchanged (deferred concern) and identifiers stay
+        out of any message.
+        """
+        try:
+            return self._store.get_approval_request(approval_id, owner_id, session_id)
+        except ApprovalCorruptError:
+            raise
+        except (TypeError, ValueError) as exc:
+            # Corrupted persisted state elsewhere in the maintenance
+            # scan (or, after a future gate-first refactor, the owned
+            # row itself). Scheduled/logged errors keep identifiers
+            # out of the raised message.
+            logger.warning(
+                "Approval read rejected by unvalidatable persisted state",
+                extra={
+                    "extra_fields": {
+                        "error_type": type(exc).__name__,
+                        "record": "approval",
+                        "approval_id": approval_id,
+                    }
+                },
+            )
+            raise ApprovalCorruptError(
+                "Approval state could not be validated."
+            ) from exc
+
+    def list_approvals_page(
+        self,
+        owner_id: str,
+        session_id: str,
+        *,
+        limit: int,
+        offset: int = 0,
+    ) -> tuple[list, int]:
+        """Identity-scoped approval inventory: (page, total) in one snapshot.
+
+        Strictly read-only delegation to the store; see
+        ``ApprovalStore.list_approvals_page`` for the semantics (no
+        cleanup, no lazy expiration, no arguments in summaries).
+        """
+        return self._store.list_approvals_page(
+            owner_id, session_id, limit=limit, offset=offset
+        )
 
     def reject_request(
         self,

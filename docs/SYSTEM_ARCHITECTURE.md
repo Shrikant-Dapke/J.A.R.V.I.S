@@ -37,9 +37,13 @@ Versions and provider choices are pinned during implementation planning.
 
 ## 3. Request lifecycle
 1. UI submits request to local API (authentication and origin checks run first).
-2. The orchestrator stores the user turn, loads the owned conversation
-   history, and calls the configured model once per turn: history plus a
-   trusted, bounded decision instruction (never persisted).
+2. The orchestrator appends the user turn to the owned conversation in
+   the persistent conversation store (shared SQLite state DB, section
+   11), selects that conversation's bounded replay window (newest
+   contiguous complete turns; at most 24 turns and 12,000 content
+   characters; the just-appended user turn is never dropped), and
+   calls the configured model once per turn: window plus a trusted,
+   bounded decision instruction (never persisted).
 3. The model's text is parsed narrowly as a decision: a plain reply, one
    tool proposal, or one bounded task plan. Non-decision-shaped text
    degrades to a plain reply; decision-shaped-but-invalid output is
@@ -84,13 +88,35 @@ Versions and provider choices are pinned during implementation planning.
 
 ## 5. Initial API
 - `POST /api/chat` — submit request; receive response, proposed action, or proposed plan.
-- `POST /api/actions/{id}/approve` — approve exact pending action.
-- `POST /api/actions/{id}/deny` — deny pending action.
-- `GET /api/actions` — recent action records.
+- `GET /api/approvals` — the session's approval inventory: metadata-only
+  summaries (no raw arguments, digest, or retention flags; the
+  `action_description` comes from the registered tool's identity and its
+  static registry text, never from submitted argument values),
+  deterministic `created_at DESC, approval_id DESC` ordering,
+  `limit`/`offset` pagination with a paired total. Strictly read-only
+  (advisory); an identity with no records observes `200` with an empty
+  page and `total: 0`. See section 10.6.
+- `GET /api/approvals/{approval_id}` — authoritative approval state with
+  lazy TTL expiration applied. Unknown/foreign/purged approvals 404 —
+  authorization runs before any payload parse, so this holds even for a
+  foreign row whose payload is damaged; only the requesting identity's
+  own corrupted record fails closed with a structured 500 and a fixed
+  message.
+- `POST /api/approvals/{approval_id}/approve` — approve and execute the
+  exact pending request once.
+- `POST /api/approvals/{approval_id}/reject` — reject a pending request.
 - `GET /api/memory` — inspect approved memory.
 - `DELETE /api/memory/{id}` — delete memory item.
+- `GET /api/plans` — the session's plan inventory: metadata summaries plus
+  attention flags (status_counts, awaiting_approval, recovery_required,
+  needs_attention), deterministic `created_at DESC, plan_id DESC` ordering,
+  `limit`/`offset` pagination with a paired total. Strictly read-only
+  (advisory); an identity with no plans observes `200` with an empty page
+  and `total: 0`. See section 10.6.
 - `GET /api/plans/{plan_id}` — inspect the session's validated task plan
-  (steps awaiting approval are reconciled with the approval store on read).
+  (steps awaiting approval are reconciled with the approval store on read)
+  plus derived status: `overall_status`, `ready_step_ids`, and the
+  attention lists (section 10.6).
 - `POST /api/plans/{plan_id}/steps/{step_id}/request` — request exactly one
   ready plan step through policy and the approval workflow: 200 returns the
   executed `ToolResult` (policy-allowed read-only tools), 202 returns the
@@ -102,6 +128,13 @@ Versions and provider choices are pinned during implementation planning.
   Approval outcomes (executed, rejected) are recorded on the owning step
   the moment they resolve, so they never depend on approval records that
   terminal retention may purge. No endpoint advances a plan automatically.
+- `GET /api/conversations` — metadata listing for the authenticated
+  identity with offset pagination (parameters, defaults, errors in
+  section 11.5).
+- `GET /api/conversations/{conversation_id}` — bounded history read;
+  returns the most recent turns and the persisted total (section 11.5).
+- `DELETE /api/conversations/{conversation_id}` — delete the session's
+  conversation (section 11.5).
 - `GET /api/health` — service health.
 
 `POST /api/chat` stays HTTP 200 for proposals and returns `status` one of
@@ -112,14 +145,21 @@ map to structured errors without executing anything:
 422 (invalid proposal, unknown tool, invalid arguments, a registered
 tool without an executable implementation, or a message beyond the
 orchestrator instruction budget), 403
-(policy deny / approval workflow state), 503 (approval or plan store at
-capacity), plus the existing LLM mappings (502/504/500).
+(policy deny / approval workflow state), 503 (approval, plan, or
+conversation capacity), plus the existing LLM mappings (502/504/500)
+and 500 when persisted conversation state cannot be validated.
+Conversation read endpoints fail closed identically: 404 (unknown or
+foreign conversation — never distinguishable), 422 (invalid query
+parameters), 500 (unvalidatable state; section 11).
 
 Mutating endpoints require `JARVIS_API_TOKEN` and `X-JARVIS-Session`. Configure
 exact browser origins with `JARVIS_ALLOWED_ORIGINS`; do not expose the service
-on a non-loopback interface. The current approval and conversation stores are
-process-local and must be replaced with shared transactional storage before
-multi-worker or multi-instance deployment.
+on a non-loopback interface. Conversation, plan, execution, and approval
+user-visible state all live in the same shared transactional SQLite
+database (section 11); the approval store is persisted there too. The
+deployment shape keeps its single-writer/process assumptions: one
+application process owns writes, and this must be revisited before
+any multi-worker or multi-instance deployment.
 
 ## 6. Tool interfaces
 - `get_system_info()` — bounded read-only result.
@@ -164,6 +204,14 @@ JARVIS/
 - Policy denies a proposal: structured 403; nothing executes.
 - Approval or plan store at capacity: structured 503; nothing executes
   (fail closed, never degrade into silent execution).
+- Conversation capacity exhausted: structured 503; the turn fails
+  closed, nothing is stored, and history is never trimmed FIFO to make
+  room for identity conversation slots.
+- Conversation state cannot be validated: structured 500
+  ("Conversation history could not be validated."); damaged turns or
+  metadata are never repaired, fabricated, or silently dropped on any
+  read or write, while deletion (DELETE) stays possible for damaged
+  rows (section 11.2).
 - Validation failure: reject before execution.
 - Approval denied/expired: do not execute.
 - Tool exception: record failure and return safe message.
@@ -208,7 +256,8 @@ Cloud provider/local model; backend process lifecycle; voice/wake-word; packagin
 ## 10. Phase 4 — Main Orchestrator and task plans
 ### 10.1 Decision contract (Milestone 4.1)
 - The orchestrator makes one bounded provider call per turn: the
-  conversation history followed by a trusted decision instruction
+  selected bounded replay window of the conversation's persisted
+  history (section 11.4) followed by a trusted decision instruction
   (`[ORCHESTRATOR INSTRUCTION - JARVIS]`) that includes the tool catalog
   from the registry as metadata only. The instruction is appended as a
   trailing user message and is never stored in conversation history.
@@ -276,14 +325,12 @@ Cloud provider/local model; backend process lifecycle; voice/wake-word; packagin
   status can never unblock a dependent step — a failed or rejected
   parent leaves its dependents permanently not-ready.
 - Terminal semantics: `GET /api/plans/{plan_id}` reconciles steps
-  awaiting approval with the approval store on read and reports which
-  steps are ready (all dependencies verifiably succeeded). COMPLETED,
-  EXECUTED, and FAILED are final: a failed, rejected, expired, or
-  unavailable step cannot be re-requested; address the cause and
-  capture a new plan via a new chat turn.
-- `GET /api/plans/{plan_id}` reconciles steps awaiting approval with the
-  approval store on read and reports which steps are ready (all
-  dependencies completed).
+  awaiting approval with the approval store on read, reports which
+  steps are ready (all dependencies verifiably succeeded), and derives
+  the whole-plan status (section 10.6). COMPLETED, EXECUTED, and FAILED
+  are final: a failed, rejected, expired, or unavailable step cannot be
+  re-requested; address the cause and capture a new plan via a new
+  chat turn.
 - Execution is explicit and single-step per call:
   `request_step_execution` clears exactly one ready step through the
   same policy + approval workflow as chat proposals, holding a plan lock
@@ -292,8 +339,9 @@ Cloud provider/local model; backend process lifecycle; voice/wake-word; packagin
   desktop UI decides which step to request next.
 
 ### 10.4 Known limitations
-- Conversations remain process-local in-memory structures (same
-  shared-storage caveat as section 5).
+- Conversation history is now durable bounded storage (section 11):
+  FIFO turns within a conversation and a fixed identity capacity, but
+  there is no summarization, semantic recall, or long-term memory yet.
 - Unknown-tool proposals surface as 422 at proposal time rather than 404
   because registration is checked before anything executes.
 - Step arguments are `dict[str, str]`, matching the existing
@@ -308,17 +356,19 @@ Cloud provider/local model; backend process lifecycle; voice/wake-word; packagin
   workers is future performance work, not a correctness gap.
 
 ### 10.5 Execution lifecycle and state (Phase 4.3)
-- All execution lifecycle state lives in one local SQLite database
-  (`backend/data/jarvis_state.db`, `JARVIS_STATE_DB_PATH` overridable):
+- All execution lifecycle state AND conversation history live in one
+  local SQLite database (`backend/data/jarvis_state.db`,
+  `JARVIS_STATE_DB_PATH` overridable; schema version 2, section 11):
   plans and step states, approval records and their executed
-  outcomes, execution attempts, and a bounded audit trail. It uses
-  WAL + full synchronous commits, `BEGIN IMMEDIATE` transactions, and
+  outcomes, execution attempts, a bounded audit trail, and
+  conversations with their ordered turns. It uses WAL + full
+  synchronous commits, `BEGIN IMMEDIATE` transactions, and
   `PRAGMA user_version` migrations; a schema newer than the
-  application fails closed at startup. It intentionally excludes
-  conversations (still process-local) and never contains secrets,
+  application fails closed at startup. It never contains secrets,
   key material, or model instructions.
-- Developments pending here remain the conversation store and the
-  multi-step retry story; the execution lifecycle itself is durable.
+- Developments pending here remain the multi-step retry story; approvals,
+  like conversation history and the execution lifecycle, are durable
+  (section 11).
 - Execution attempts are first-class rows with unique ids and a
   central state machine: `CLAIMED → STARTED → SUCCEEDED | FAILED |
   TIMED_OUT`, `CLAIMED → FAILED` (interrupted), `TIMED_OUT →
@@ -334,6 +384,207 @@ Cloud provider/local model; backend process lifecycle; voice/wake-word; packagin
   verbatim; unknown outcomes require a human. Recovery counters are
   logged and audited (`recovery_required`, `interrupted`,
   `outcome_applied`, `errors`).
+
+### 10.6 Inventories and derived plan status (Phase 5.2; cleanup isolation Phase 5.3)
+- `GET /api/plans` and `GET /api/approvals` are the session identity's
+  read-only inventories: deterministic `created_at DESC, id DESC`
+  ordering, `limit`/`offset` pagination served with a paired identity-
+  scoped total from ONE `BEGIN IMMEDIATE` transaction, and explicit
+  capacity errors (422 for bad query parameters). An identity with no
+  records observes `200` with an empty page and `total: 0` — other
+  identities' resources are never listed and never distinguishable from
+  unknown ones. Both summaries are metadata-only: approval listings
+  carry tool name, action description, risk level, persisted status, and
+  timestamps — never raw arguments, digests, or retention flags. The
+  `action_description` in inventories is built from the registered
+  tool's identity and its static registry description (never from
+  submitted argument values), so no execution argument value can reach
+  a listing — flat or nested values alike.
+- Inventory reads are strictly **advisory**: no reconcile, no lazy
+  expiration, no state transition, no audit events, no attempts. The
+  **authoritative** reads are `GET /api/plans/{plan_id}` (reconciles
+  steps awaiting approval with the approval store, reports ready steps
+  and derived status) and `GET /api/approvals/{approval_id}` (applies
+  lazy TTL expiration). Advisory listings may therefore trail the
+  authoritative state until a detail read.
+- Both detail reads authorize (owner + session) BEFORE parsing payloads:
+  unknown, foreign, and purged resources observe 404 and never reveal
+  themselves — including a foreign row whose payload is damaged, which
+  is answered exactly like any other foreign resource (404). A corrupted
+  persisted plan or approval payload of the REQUESTING identity fails
+  closed with a structured 500 and a fixed, non-sensitive message
+  ("Plan state could not be validated." / "Approval state could not be
+  validated.") — no raw payload, arguments, digest, or identifiers in
+  responses; never repaired or served.
+- The approval maintenance scan (TTL expiry + terminal-retention purge)
+  is row-local and metadata-driven (Phase 5.3): expiry and retention
+  decisions come from the persisted status/deadline columns only, the
+  payload is read exactly once and only to rewrite a record expiring
+  right now, and every row is handled independently — one record with
+  invalid metadata or a damaged payload is skipped (logged, lifecycle
+  untouched: no invented timestamps, no invented transitions, no
+  purging) instead of aborting the scan. Corrupt terminal rows still
+  purge purely by metadata once their retention window passes, so
+  capacity keeps its retention guarantee; healthy TTL, retention,
+  single-use claims, lifecycle transitions, and the expiry audit event
+  are preserved exactly, and one identity's damage can never disrupt
+  unrelated identities' approval operations.
+- `GET /api/plans/{plan_id}` additionally derives deterministic status
+  from persisted step state: `overall_status` with the exact precedence
+  `recovery_required > awaiting_approval > actionable > failed >
+  in_progress > completed`, `ready_step_ids` (PENDING steps whose
+  dependencies all have recorded successful results), and the attention
+  lists. `needs_attention` is true while any step is RECOVERY_REQUIRED
+  or AWAITING_APPROVAL. A plan with unresolvable malformed state fails
+  closed instead of inventing a status.
+- Uncertain mutating executions surface as `RECOVERY_REQUIRED` steps in
+  inventory, detail, and the derived status. They require humans: the
+  resolution path `POST /api/plans/{plan_id}/steps/{step_id}/resolve-
+  recovery` resolves the step FAILED with `execution_uncertain` and
+  finalizes the standing mutation attempt (RECONCILED). There is NO
+  automatic retry and no automatic recovery decision anywhere.
+- `recovery_scan_completed` audit events are process-level summaries:
+  detail carries exactly the counters `interrupted`,
+  `recovery_required`, `outcome_applied`, `errors` (integers), with no
+  identity fields and one event per scan. Per-work recovery events
+  (`execution_interrupted`, `recovery_required`,
+  `recovery_outcome_applied`) remain identity-scoped and reference the
+  concrete plan/approval rows they touched.
+
+## 11. Conversation persistence and bounded context (Phase 5.1)
+
+### 11.1 Storage
+- `PersistentConversationStore`
+  (`backend/app/services/conversation_store.py`) is the single
+  conversation authority for chat, orchestration, and the API routes;
+  it wraps the shared `ExecutionStateDb` façade. There is exactly one
+  conversation persistence implementation, and no conversation state
+  lives in process memory.
+- Conversations join every other durable structure in one local SQLite
+  database (`backend/data/jarvis_state.db`, `JARVIS_STATE_DB_PATH`
+  overridable), migrated to schema version 2 (`PRAGMA user_version`;
+  a newer schema fails closed at startup). Version 2 adds:
+  - `conversations` — `conversation_id`, `owner_id`, `session_id`,
+    `created_at`, `updated_at`, non-negative `turn_count`; the
+    identity columns make every read identity-scoped, and an index
+    makes the listing order `updated_at DESC, conversation_id DESC`
+    deterministic.
+  - `conversation_messages` — one row per turn: identity +
+    conversation, a per-conversation monotone sequence number (`seq`),
+    `role` (CHECK: user/assistant), bounded `content`
+    (CHECK: non-empty, ≤ 4,000 characters), and a preserved verbatim
+    timestamp. Turns are read back strictly in `seq` order and
+    returned exactly as stored.
+- Every mutation is ONE `BEGIN IMMEDIATE` transaction on the façade:
+  the capacity check and conversation creation commit atomically, and
+  append + FIFO retention + metadata updates commit or roll back
+  together. Listing pagination is served by one façade transaction
+  (`list_conversations_page`) that pairs the page rows with the
+  identity-scoped total, so a response never mixes instants under
+  concurrent chat traffic.
+- History survives backend restarts; the state file is gitignored.
+
+### 11.2 Identity and security
+- Every conversation is bound at insertion to its creator's `(owner_id,
+  session_id)` — the authenticated bearer-token owner identity plus
+  the explicit session header — and ownership is never rebound.
+- Reads, writes, listings, and deletions are always scoped to the
+  caller's exact identity. Another identity's conversation is
+  indistinguishable from an unknown one (structured 404, identical
+  response), listing never contains foreign metadata, and no response
+  ever leaks cross-identity content.
+- All conversation endpoints require token authentication; DELETE
+  additionally requires a safe configured browser Origin; GET
+  endpoints are read-only and never validate Origin.
+- Reads validate strictly: a turn's role, content bounds, and
+  timestamp, and a conversation's `created_at`/`updated_at`, are
+  checked on every data-serving read. Identity rejection runs BEFORE
+  validation, keeping foreign damaged state indistinguishable from
+  unknown state. Damaged state raises
+  `ConversationCorruptError` ("Conversation history could not be
+  validated."): it is never repaired, fabricated, or silently
+  dropped — the affected request fails closed — while DELETE stays
+  possible for damaged rows because deletion never has to interpret
+  content. Error messages and logs carry identifiers only, never
+  conversation content or credentials.
+
+### 11.3 Retention and capacity
+- At most 400 turns per conversation (`MAX_CONVERSATION_TURNS`):
+  appending beyond that drops the OLDEST turns FIFO. The per-turn
+  content bound is 4,000 characters.
+- At most 256 conversations per identity (`MAX_CONVERSATIONS_PER_IDENTITY`,
+  owner/session scoped). A further creation fails closed with
+  `ConversationCapacityError` (structured 503): no summaries, no
+  silent replacement, and history is never trimmed to create a slot.
+- Listing/order helpers exist independently of these ceilings; the API
+  documents its own page bounds in 11.5.
+
+### 11.4 Bounded context retrieval (replay window)
+- Per turn, the orchestrator sends the newest contiguous span of
+  complete turns that fits both hard budgets — at most 24 turns
+  (`MAX_HISTORY_REPLAY_TURNS`) and 12,000 content characters
+  (`MAX_HISTORY_REPLAY_CHARS`; equality fits) — selected by the pure
+  function `select_replay_window`
+  (`backend/app/services/orchestrator.py`). The backward walk stops at
+  the FIRST turn that does not fit, so the provider sees a contiguous
+  newest span and never a hole-punched history, and the
+  just-appended current user turn is always kept even if it alone
+  exhausts the remaining budget.
+- Turns are sent chronologically (oldest → newest). Selection never
+  mutates persistent history: storage keeps up to the full 400 turns
+  and only the provider view is bounded.
+- Formal maximum prompt contribution of persisted context: at most
+  12,000 characters of history plus the bounded trusted instruction
+  overhead — at most 4,000 characters per applicable trusted
+  instruction part (`MAX_INSTRUCTION_LENGTH` = 4000 for the whole
+  decision instruction, itself composed of the bounded parts in 10.1).
+- These are character limits enforced by this codebase. They are
+  distinct from provider-specific token accounting (providers translate
+  the same characters into different token counts) and from the current
+  user request: the request slot inside the instruction (1,500 of its
+  4,000 characters) bounds the user request, which always reaches the
+  model or fails closed as a 422 (never silently truncated).
+
+### 11.5 Conversation API
+All three endpoints require authentication (bearer `JARVIS_API_TOKEN`
++ session header); GET endpoints are read-only; DELETE additionally
+validates the browser Origin. Errors are the shared structured error
+envelope; foreign and unknown conversations always share one 404.
+
+`GET /api/conversations`
+- Query: `limit` (default 50; allowed 1–200), `offset` (default 0;
+  allowed ≥ 0). Invalid values → 422 `VALIDATION_ERROR`.
+- Response 200: `{"conversations": [{"conversation_id",
+  "created_at", "updated_at", "turn_count"}, ...], "total", "limit",
+  "offset"}` — metadata only, never message content or identity
+  fields beyond the ordering itself.
+- Ordering: `updated_at DESC, conversation_id DESC` with the most
+  recently active conversation first; a repeated page is identical
+  while rows are unchanged, and page rows plus `total` come from one
+  consistent transaction (11.1).
+- Errors: 401 (unauthenticated), 422 (invalid parameters), 500
+  (metadata that cannot be validated).
+
+`GET /api/conversations/{conversation_id}`
+- Query: `limit` (default 100; allowed 1–400) — returns the MOST
+  RECENT `limit` turns while preserving chronological (oldest →
+  newest) ordering; reading never modifies stored history.
+- Response 200: `{"conversation_id", "turns": [{"role", "content",
+  "timestamp"}, ...], "turn_count", "total_turn_count"}` where
+  `turn_count` counts the turns in THIS response (backward-compatible
+  windowed view) and `total_turn_count` is the persisted total.
+- Errors: 401 (unauthenticated), 404 (unknown or foreign —
+  indistinguishable), 422 (invalid parameters), 500 (state that
+  cannot be validated).
+
+`DELETE /api/conversations/{conversation_id}`
+- Removes the identity's conversation and every stored turn in one
+  transaction; it also succeeds on rows whose stored state cannot be
+  validated because deletion never interprets content.
+- Response 200: `{"conversation_id", "status": "deleted"}`.
+- Errors: 401 (unauthenticated), 403 (missing/foreign Origin), 404
+  (unknown or foreign). This pre-existing contract is unchanged by
+  Phase 5.1.
 
 ## Architecture principle
 **The model proposes; policy authorizes; tools execute; verification establishes the result.**

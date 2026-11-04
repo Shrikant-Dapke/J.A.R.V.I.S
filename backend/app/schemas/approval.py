@@ -98,3 +98,44 @@ class ApprovalRequest(BaseModel):
         if self.expires_at <= self.created_at:
             raise ValueError("expires_at must be after created_at")
         return self
+
+
+class ApprovalSummary(BaseModel):
+    """One approval's inventory metadata for the authenticated identity.
+
+    Metadata only: derived from the strictly validated persisted record
+    with raw execution arguments structurally dropped. Integrity
+    digests, retention (purged) flags, and identity fields never appear
+    here; the authenticated detail endpoint remains the only way to
+    fetch the exact approved request, including its arguments.
+    """
+
+    approval_id: str = Field(description="Approval request identifier")
+    tool_name: str = Field(description="Tool the approval guards")
+    action_description: str = Field(
+        description="Human-readable description of the guarded action"
+    )
+    risk_level: RiskLevel = Field(description="Risk classification of the action")
+    status: ApprovalStatus = Field(
+        description=(
+            "Persisted lifecycle status (verbatim, advisory: expiration "
+            "is applied on authoritative detail reads, not by this listing)"
+        )
+    )
+    created_at: datetime = Field(description="Creation timestamp (UTC)")
+    expires_at: datetime = Field(description="Absolute expiration timestamp (UTC)")
+    resolved_at: Optional[datetime] = Field(
+        default=None,
+        description="Resolution timestamp (UTC) once the request is terminal",
+    )
+
+
+class ApprovalListResponse(BaseModel):
+    """Metadata page for the authenticated identity's approval records."""
+
+    approvals: list[ApprovalSummary] = Field(
+        description="Approvals ordered by creation, newest first"
+    )
+    total: int = Field(description="Total non-purged approvals for the identity")
+    limit: int = Field(description="Page size actually applied")
+    offset: int = Field(description="Offset actually applied")

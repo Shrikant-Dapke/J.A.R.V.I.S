@@ -5,8 +5,11 @@ existing chat flow. It:
 
 1. Stores the user turn under the authenticated identity (conversation
    ownership and session boundaries are preserved from Phase 2/3).
-2. Calls the configured LLM provider with the conversation history plus
-   a trusted orchestration instruction to obtain a structured decision.
+2. Calls the configured LLM provider with a bounded replay window of the
+   conversation history — the newest COMPLETE turns that fit the
+   configured turn and character budgets; persisted history itself is
+   never rewritten or truncated — plus a trusted orchestration
+   instruction to obtain a structured decision.
 3. Validates the decision strictly (model output is untrusted):
    - ``reply`` — plain conversational answer.
    - ``tool_action`` — ONE registered tool with bounded string args.
@@ -39,6 +42,7 @@ from typing import Callable, Mapping, Optional
 from app.core.logging import get_logger
 from app.schemas.approval import ApprovalRequest
 from app.schemas.chat import ChatResponse
+from app.schemas.conversation import ConversationTurn
 from app.schemas.llm import LLMMessage, LLMResponse
 from app.schemas.orchestration import (
     EMPTY_TEXT_REPLY,
@@ -61,7 +65,7 @@ from app.services.approval_service import (
 )
 from app.services.approval_store import ApprovalCapacityError
 from app.services.conversation_store import (
-    InMemoryConversationStore,
+    PersistentConversationStore,
     conversation_store,
 )
 from app.services.llm.base import LLMProvider
@@ -96,6 +100,14 @@ MAX_INSTRUCTION_LENGTH = 4000
 MAX_USER_REQUEST_SLOT = 1500
 MAX_TOOL_CATALOG_LENGTH = 1300
 
+# Provider replay budget (Phase 5.1): every conversational provider call
+# replays at most the newest 24 complete turns and at most 12,000
+# characters of history, regardless of how large the persisted
+# conversation grows. The budgets bound the PROMPT only; stored history
+# is never cut, rewritten, or summarized here.
+MAX_HISTORY_REPLAY_TURNS = 24
+MAX_HISTORY_REPLAY_CHARS = 12000
+
 ORCHESTRATOR_INSTRUCTION_PREFIX = "[ORCHESTRATOR INSTRUCTION - JARVIS]"
 USER_REQUEST_MARKER = "USER REQUEST:"
 
@@ -126,6 +138,50 @@ def _bounded_text(text: str, limit: int) -> str:
     return text[:limit]
 
 
+def select_replay_window(
+    history: list[ConversationTurn],
+) -> list[ConversationTurn]:
+    """Select the bounded provider replay window from stored history.
+
+    Whole-turn selection policy (Phase 5.1):
+
+    - The input is the identity-verified stored history in chronological
+      order, INCLUDING the current user message as its newest element.
+    - The current user message (newest turn) is always included — even
+      in the theoretical case where it alone would exceed the character
+      budget. It is never dropped, never truncated.
+    - Older turns are then added newest-first, one WHOLE turn at a
+      time, while the window stays within both budgets: at most
+      ``MAX_HISTORY_REPLAY_TURNS`` turns and at most
+      ``MAX_HISTORY_REPLAY_CHARS`` characters of turn content
+      (hitting a budget exactly still counts as fitting).
+    - The backward walk stops at the first older turn that does not
+      fit entirely. The result is therefore always the newest
+      CONTIGUOUS span of complete turns: the provider never sees a
+      mid-history gap, and no turn is ever truncated, split, paired
+      down, or silently rewritten.
+    - Chronological order is restored before returning; the caller's
+      list is not mutated and the store is not touched — this is pure
+      post-processing of already-ownership-checked turns, so it cannot
+      bypass any authentication or identity boundary.
+    """
+    if not history:
+        return []
+    current = history[-1]
+    window = [current]
+    used = len(current.content)
+    if used <= MAX_HISTORY_REPLAY_CHARS:
+        for turn in reversed(history[:-1]):
+            if len(window) >= MAX_HISTORY_REPLAY_TURNS:
+                break
+            if used + len(turn.content) > MAX_HISTORY_REPLAY_CHARS:
+                break
+            window.append(turn)
+            used += len(turn.content)
+    window.reverse()
+    return window
+
+
 class ChatOrchestrator:
     """Single controlled orchestrator behind the chat service boundary."""
 
@@ -136,7 +192,7 @@ class ChatOrchestrator:
         approvals: ApprovalService = approval_service,
         plans: PlanService = plan_service,
         registry: ToolRegistry = tool_registry,
-        conversations: InMemoryConversationStore = conversation_store,
+        conversations: PersistentConversationStore = conversation_store,
     ) -> None:
         self._provider_factory = provider_factory or get_llm_provider
         self._approvals = approvals
@@ -161,8 +217,11 @@ class ChatOrchestrator:
         history = self._conversations.get_history(
             resolved_id, owner_id=owner_id, session_id=session_id
         ) or []
+        # Only the newest complete turns that fit the replay budgets
+        # reach the provider; the persisted history itself is untouched.
         messages = [
-            LLMMessage(role=turn.role, content=turn.content) for turn in history
+            LLMMessage(role=turn.role, content=turn.content)
+            for turn in select_replay_window(history)
         ]
 
         provider = self._provider_factory()

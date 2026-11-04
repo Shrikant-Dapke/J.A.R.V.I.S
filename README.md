@@ -47,11 +47,32 @@ cd backend
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env
 uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Set `JARVIS_API_TOKEN` in `.env` to a random value of at least 32
+### Local environment configuration
+
+Environment configuration is private and created locally on each
+machine: the backend reads `backend/.env`, which lives outside version
+control and is not included in the repository. No sample environment
+file is provided — create the file yourself and add only the variables
+you need. Required and common variable names (values are never part of
+these instructions):
+
+```text
+# backend/.env  (private, local-only; not committed)
+JARVIS_API_TOKEN=<high-entropy secret, at least 32 random characters>
+HOST=127.0.0.1
+PORT=8000
+```
+
+Other optional variable names: `JARVIS_ALLOWED_ORIGINS` (comma-separated
+browser origins), `TOOL_TIMEOUT_SECONDS`, `JARVIS_STATE_DB_PATH`,
+`LOG_LEVEL`, `LOG_FORMAT`, plus the provider settings documented in the
+orchestration sections (`LLM_PROVIDER`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`,
+`OLLAMA_TIMEOUT_SECONDS`, `OLLAMA_NUM_CTX`, `GEMINI_API_KEY`).
+
+Set `JARVIS_API_TOKEN` to a random value of at least 32
 characters before calling protected routes.
 
 Health check: `GET http://127.0.0.1:8000/api/health`
@@ -121,14 +142,70 @@ structurally impossible), registered tools only, string-only arguments.
 Capturing a plan executes nothing; steps run **one at a time, explicitly**:
 
 ```text
-GET  /api/plans/{plan_id}                              # inspect plan (approval state reconciled)
+GET  /api/plans                                        # read-only plan inventory (advisory)
+GET  /api/plans/{plan_id}                              # inspect plan (authoritative; approval state reconciled)
 POST /api/plans/{plan_id}/steps/{step_id}/request      # run one ready step through policy/approval
+POST /api/plans/{plan_id}/steps/{step_id}/resolve-recovery  # explicit human resolution of RECOVERY_REQUIRED
+
+GET  /api/approvals                                    # read-only approval inventory (metadata only)
+GET  /api/approvals/{approval_id}                      # authoritative approval state (lazy TTL expiration)
+POST /api/approvals/{approval_id}/approve              # approve and execute exactly once
+POST /api/approvals/{approval_id}/reject               # reject a pending request
 ```
+
+`GET /api/plans` and `GET /api/approvals` are strictly advisory and
+read-only: both paginate with `limit`/`offset` (plan limit default 50,
+approval limit 50, max 200 for either, `offset >= 0` → otherwise 422),
+return a paired identity-scoped `total`, are newest-first deterministic
+(`created_at DESC`, id tiebreak), and never write, reconcile, expire, or
+audit anything. Approval summaries are metadata-only (tool name, action
+description, risk level, status, timestamps) and never contain raw
+arguments, digests, or retention flags; the `action_description` shown
+in inventories is built from the registered tool's identity and its
+static registry description — never from submitted argument values. Listing results may trail the
+authoritative state until you read the detail routes. Approval records
+persist in the shared SQLite state database (details below); only the
+request wiring executes in-process under the single-writer/process
+assumptions.
 
 A policy-allowed read-only step executes and returns the `ToolResult`
 (200); a mutating step returns a pending approval (202) bound to the
 exact arguments. There is no scheduler, no auto-advancement, and no
 autonomous loop — the desktop UI decides which step to request next.
+
+`GET /api/plans/{plan_id}` is the authoritative detail read: it
+reconciles steps awaiting approval with the approval store on read and
+derives a deterministic `overall_status` from persisted state, with the
+exact precedence `recovery_required > awaiting_approval > actionable >
+failed > in_progress > completed`, alongside `ready_step_ids` (pending
+steps whose dependencies have recorded successful results) and
+`recovery_required` / `awaiting_approval` / `needs_attention` lists.
+A `recovery_required` plan always reflects a mutating execution whose
+side effect could not be proven after a restart; it waits for explicit
+human resolution (endpoint above) — there is **no automatic retry** and
+no automatic recovery decision.
+
+Identity boundaries per endpoint:
+
+| Endpoint | Unknown or foreign resource behavior |
+| --- | --- |
+| `GET /api/plans` | `200` with an empty identity-scoped result (`total: 0`) |
+| `GET /api/approvals` | `200` with an empty identity-scoped result (`total: 0`) |
+| `GET /api/plans/{id}` | `404` ("Plan was not found") |
+| `GET /api/approvals/{id}` | `404` ("Approval request was not found") |
+
+Listings report exactly the authenticated owner + session's rows, so an
+identity never learns that other resources exist; detail reads authorize
+owner + session BEFORE parsing payloads and answer 404 regardless of the
+row's payload health. A damaged row of the requesting identity fails
+closed with a structured 500 carrying a fixed, non-sensitive message
+("Plan state could not be validated." / "Approval state could not be
+validated.") — payload content, arguments, digests, and internals never
+appear in any error. The approval maintenance scan (TTL expiry and
+terminal-retention purge) is row-local: decisions use persisted metadata
+columns only, a record with invalid metadata or a damaged payload is
+skipped without any lifecycle change, so one identity's damage can never
+disrupt unrelated identities' approval operations.
 
 Steps are **terminal once resolved** and always carry their recorded
 outcome: `COMPLETED`/`EXECUTED` mean the step's `ToolResult` succeeded
@@ -142,12 +219,22 @@ chat turn instead.
 ### Execution reliability (Milestone 4.3)
 
 Plans, plan-step states, approval records and their executed outcomes,
-execution attempts, and a bounded audit trail now persist in one local
-SQLite file (`JARVIS_STATE_DB_PATH`, default `backend/data/jarvis_state.db`,
-gitignored) using WAL + full synchronous commits and `BEGIN IMMEDIATE`
-transactions. The database never contains secrets, key material, or
-model instructions, and conversations intentionally remain
-process-local.
+execution attempts, a bounded audit trail, and conversations with their
+ordered turns now persist in one local SQLite file (`JARVIS_STATE_DB_PATH`,
+default `backend/data/jarvis_state.db`, gitignored) at schema version 2,
+using WAL + full synchronous commits and `BEGIN IMMEDIATE` transactions
+(`PRAGMA user_version` migrations; a newer schema fails closed). The
+database never contains secrets, key material, or model instructions.
+
+Conversation history (Phase 5.1) is bounded by construction: up to 400
+turns per conversation (oldest-first FIFO beyond that), up to 256
+conversations per owner/session identity (exhaustion fails closed with
+503), and every turn validates strictly on read — damaged state fails
+closed with a structured 500 and is never repaired or silently dropped.
+Conversation metadata can be listed with offset pagination via
+`GET /api/conversations` (limit default 50, max 200) and read back in
+bounded windows via `GET /api/conversations/{id}` (limit default 100,
+max 400, newest turns first, returned oldest-to-newest).
 
 The execution workflow is now crash-honest end to end:
 
@@ -185,12 +272,14 @@ The execution workflow is now crash-honest end to end:
 ## LLM Providers
 
 Three interchangeable providers live behind `backend/app/services/llm/`. The
-provider contract is unchanged: providers receive the conversation history
-plus a trailing trusted orchestrator instruction (never persisted) and
-return plain assistant text only. **The model never executes tools and its
-output is treated as untrusted** — the Phase 4 orchestrator parses it into
-a reply, tool proposal, or plan, and all proposals still route through
-policy and the approval workflow.
+provider contract is unchanged in shape: providers receive a bounded
+replay window of the persisted conversation history — the newest
+contiguous complete turns, at most 24 turns and 12,000 content
+characters — plus a trailing trusted orchestrator instruction (never
+persisted) and return plain assistant text only. **The model never
+executes tools and its output is treated as untrusted** — the Phase 4
+orchestrator parses it into a reply, tool proposal, or plan, and all
+proposals still route through policy and the approval workflow.
 
 | Provider | Purpose | Requires |
 |----------|---------|----------|
@@ -223,7 +312,7 @@ scope for this phase.
 
    Verify with `ollama list`. Type `/bye` to exit the interactive run.
 
-3. **Configure `backend/.env`** (copy from `.env.example` first):
+3. **Configure `backend/.env`** (create the private local file as described in *Backend Setup*; no sample environment file exists):
 
    ```text
    LLM_PROVIDER=ollama

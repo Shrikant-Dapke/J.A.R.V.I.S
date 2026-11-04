@@ -26,7 +26,7 @@ from app.services.approval_store import (
 )
 from app.services.conversation_store import (
     ConversationNotFoundError,
-    InMemoryConversationStore,
+    PersistentConversationStore,
 )
 from app.services.llm.base import LLMProvider
 from app.services.llm.errors import (
@@ -133,7 +133,7 @@ def fresh_orchestrator(provider):
         store=ApprovalStore(),
     )
     plans = PlanService(registry=tool_registry, approvals=approvals)
-    conversations = InMemoryConversationStore()
+    conversations = PersistentConversationStore()
     orchestrator = ChatOrchestrator(
         provider_factory=lambda: provider,
         approvals=approvals,

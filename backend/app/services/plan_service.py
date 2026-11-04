@@ -40,7 +40,9 @@ plan must be captured instead of repeating the same execution request.
 Uncertain steps require an explicit, human-initiated resolution.
 """
 
+import json
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from uuid import uuid4
 from typing import Callable, Optional, Union
@@ -48,6 +50,7 @@ from typing import Callable, Optional, Union
 from app.core.logging import get_logger
 from app.schemas.approval import ApprovalRequest, ApprovalStatus
 from app.schemas.plan import (
+    PlanOverallStatus,
     MAX_PLAN_STEPS,
     PlanStep,
     PlanStepStatus,
@@ -98,6 +101,161 @@ class PlanCapacityError(RuntimeError):
     """Raised when the bounded plan store is exhausted."""
 
 
+class PlanCorruptError(RuntimeError):
+    """Raised when a stored plan payload cannot be validated.
+
+    Same fail-closed doctrine as ``ConversationCorruptError``: damaged
+    state is never served, repaired, or silently skipped; the message is
+    a fixed, non-sensitive string (identifiers go to logs only).
+    """
+
+
+@dataclass(frozen=True)
+class PlanSummaryView:
+    """One identity-authorized plan ready for inventory summarization."""
+
+    plan_id: str
+    created_at: str
+    updated_at: str
+    plan: TaskPlan
+
+
+def summarize_plan_steps(plan: TaskPlan) -> dict:
+    """Derive inventory attention fields from persisted steps (pure).
+
+    Never mutates anything and never reconciles: fields describe the
+    plan exactly as stored, advisory until an authoritative detail read.
+
+    Derivation rules (Phase 5.2-a):
+    - ``status_counts`` counts every step of every status present.
+    - ``recovery_required`` lists step ids of RECOVERY_REQUIRED steps.
+    - ``awaiting_approval`` lists step ids of AWAITING_APPROVAL steps.
+    - ``needs_attention`` is deterministically True while ANY step is
+      RECOVERY_REQUIRED or AWAITING_APPROVAL — a plan containing
+      unresolved recovery work or pending approvals is never presented
+      as safe; a plan of only terminal successful steps (or plain
+      pending steps) is False.
+    """
+    counts: dict[str, int] = {}
+    recovery_required: list[str] = []
+    awaiting_approval: list[str] = []
+    for step in plan.steps:
+        status = step.status.value
+        counts[status] = counts.get(status, 0) + 1
+        if step.status is PlanStepStatus.RECOVERY_REQUIRED:
+            recovery_required.append(step.step_id)
+        elif step.status is PlanStepStatus.AWAITING_APPROVAL:
+            awaiting_approval.append(step.step_id)
+    return {
+        "status_counts": counts,
+        "recovery_required": recovery_required,
+        "awaiting_approval": awaiting_approval,
+        "needs_attention": bool(recovery_required or awaiting_approval),
+    }
+
+
+def _recorded_success(step) -> bool:
+    """Did this step verifiably succeed, per persisted evidence?
+
+    Dependency readiness and overall completion count ONLY a terminal
+    success status (COMPLETED/EXECUTED) whose recorded ToolResult is
+    present and successful. A terminal-success status without a
+    recorded successful result is treated as an unresolved failure:
+    an outcome-blind status can never unblock dependents and never
+    completes a plan (same rule the 4.2 execution foundation applies
+    to dependencies).
+    """
+    result = step.result
+    return (
+        result is not None
+        and result.success
+        and step.status in (PlanStepStatus.COMPLETED, PlanStepStatus.EXECUTED)
+    )
+
+
+def derive_plan_status(plan: TaskPlan) -> dict:
+    """Derive whole-plan status fields (pure; persisted state only).
+
+    Never reconciles, mutates, or writes anything; every field is a
+    deterministic read of the plan exactly as it is persisted. This is
+    the detail-side enrichment; the listing side flags come from
+    ``summarize_plan_steps`` (which this function reuses for the
+    attention lists so both sides can never disagree).
+
+    Derivation rules (Phase 5.2-c precedence, applied in order):
+    - ``recovery_required`` — at least one step is RECOVERY_REQUIRED.
+    - ``awaiting_approval`` — at least one step is AWAITING_APPROVAL.
+    - ``actionable`` — at least one PENDING step is dependency-ready
+      (every dependency satisfied by a recorded successful result).
+    - ``failed`` — at least one step is FAILED, or carries a
+      terminal-success status without a recorded successful result
+      (an outcome-blind status resolves as an honest failure), while
+      no earlier rule applied.
+    - ``in_progress`` — PENDING steps remain but none is ready
+      (chains waiting on work that is not yet done).
+    - ``completed`` — every step verifiably succeeded (recorded
+      successful results included).
+
+    Edge cases:
+    - A plan with no steps is malformed (the schema requires at least
+      one) and fails closed with ``PlanCorruptError`` like other
+      damaged state.
+    - Unknown step states cannot reach this function: the schema
+      parses only the six enum values and a parse failure is a
+      corruption error.
+    - Dependencies that do not exist are simply unsatisfied (the
+      schema forbids them, so this is a defensive no-block rather
+      than an exception).
+    - Dependent steps of RECOVERY_REQUIRED / AWAITING_APPROVAL /
+      FAILED steps are never ready: those steps verifiably did not
+      succeed.
+    """
+    if not plan.steps:
+        raise PlanCorruptError("Plan state could not be validated.")
+
+    attention = summarize_plan_steps(plan)
+    succeeded_ids = {
+        step.step_id for step in plan.steps if _recorded_success(step)
+    }
+    ready_step_ids = [
+        step.step_id
+        for step in plan.steps
+        if step.status is PlanStepStatus.PENDING
+        and all(dependency in succeeded_ids for dependency in step.depends_on)
+    ]
+    has_failed_step = any(
+        step.status is PlanStepStatus.FAILED or (
+            step.status in (PlanStepStatus.COMPLETED, PlanStepStatus.EXECUTED)
+            and not _recorded_success(step)
+        )
+        for step in plan.steps
+    )
+    has_pending_step = any(
+        step.status is PlanStepStatus.PENDING for step in plan.steps
+    )
+
+    if attention["recovery_required"]:
+        overall = PlanOverallStatus.RECOVERY_REQUIRED
+    elif attention["awaiting_approval"]:
+        overall = PlanOverallStatus.AWAITING_APPROVAL
+    elif ready_step_ids:
+        overall = PlanOverallStatus.ACTIONABLE
+    elif has_failed_step:
+        overall = PlanOverallStatus.FAILED
+    elif has_pending_step:
+        overall = PlanOverallStatus.IN_PROGRESS
+    else:
+        overall = PlanOverallStatus.COMPLETED
+
+    return {
+        "overall_status": overall,
+        "ready_step_ids": ready_step_ids,
+        "recovery_required": attention["recovery_required"],
+        "awaiting_approval": attention["awaiting_approval"],
+        "needs_attention": attention["needs_attention"],
+    }
+
+
 class PlanService:
     """Store validated plans and drive their steps one explicit call at a time."""
 
@@ -146,15 +304,21 @@ class PlanService:
         return TaskPlan.model_validate(plan.model_dump())
 
     def _owned_plan(self, plan_id: str, owner_id: str, session_id: str) -> TaskPlan:
-        """Authorize access before any state is read."""
-        record = self._db.get_plan_record(plan_id)
+        """Authorize access before any payload is parsed.
+
+        The identity gate runs on the raw row first, so unknown and
+        foreign plans always observe not-found — a corrupt foreign row
+        never reveals itself. Only the owning identity's corrupt rows
+        then fail closed with ``PlanCorruptError`` (5.2-c).
+        """
+        row = self._db.get_plan_row(plan_id)
         if (
-            record is None
-            or record.owner_id != owner_id
-            or record.session_id != session_id
+            row is None
+            or row.owner_id != owner_id
+            or row.session_id != session_id
         ):
             raise PlanNotFoundError("Plan was not found")
-        return record.plan
+        return self._validated_plan_payload(plan_id, row.payload)
 
     def _store_plan(
         self, plan: TaskPlan, owner_id: str, session_id: str
@@ -230,6 +394,73 @@ class PlanService:
             reconciled = self._reconcile(plan, owner_id, session_id)
             return self._copy(reconciled)
 
+    def list_plans_page(
+        self,
+        *,
+        owner_id: str,
+        session_id: str,
+        limit: int,
+        offset: int = 0,
+    ) -> tuple[list[PlanSummaryView], int]:
+        """Identity-scoped plan inventory: (page, total) in one snapshot.
+
+        STRICTLY READ-ONLY (Phase 5.2-a): never reconciles approvals,
+        never mutates step status, never appends audit events, and never
+        creates attempts. Rows arrive from the façade's single
+        ``BEGIN IMMEDIATE`` transaction (page + total, deterministic
+        ``created_at DESC, plan_id DESC`` ordering).
+
+        Every payload is validated strictly; a corrupted plan raises
+        ``PlanCorruptError`` with a fixed non-sensitive message instead
+        of serving, repairing, or silently skipping the damaged row.
+        Owner/session columns are read from the filtered rows, so only
+        the requesting identity's plans can ever appear.
+        """
+        records, total = self._db.plan_summaries_page(
+            owner_id, session_id, limit=limit, offset=offset
+        )
+        views = [self._validated_plan_view(record) for record in records]
+        return views, total
+
+    def _validated_plan_view(self, record) -> PlanSummaryView:
+        """Validate one stored plan payload strictly, or fail closed."""
+        plan = self._validated_plan_payload(record.plan_id, record.payload)
+        return PlanSummaryView(
+            plan_id=record.plan_id,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            plan=plan,
+        )
+
+    def _validated_plan_payload(self, plan_id: str, payload: str) -> TaskPlan:
+        """Parse and strictly validate one stored plan payload.
+
+        Fail closed: malformed payloads raise ``PlanCorruptError`` with
+        a fixed non-sensitive message — never served, repaired, or
+        skipped; identifiers go to logs only.
+        """
+        try:
+            parsed = json.loads(payload)
+            if not isinstance(parsed, dict):
+                raise TypeError("plan payload is not a JSON object")
+            return TaskPlan.model_validate(parsed)
+        except (TypeError, ValueError) as exc:
+            # ValidationError and JSONDecodeError are ValueError
+            # subclasses; identifiers and internals stay out of logs.
+            logger.warning(
+                "Corrupted plan payload rejected on read",
+                extra={
+                    "extra_fields": {
+                        "error_type": type(exc).__name__,
+                        "record": "plan",
+                        "plan_id": plan_id,
+                    }
+                },
+            )
+            raise PlanCorruptError(
+                "Plan state could not be validated."
+            ) from exc
+
     @staticmethod
     def _step_succeeded(step: PlanStep) -> bool:
         """Only a recorded successful outcome proves a step succeeded.
@@ -238,14 +469,12 @@ class PlanService:
         step without an observable result, and such a step must not
         unblock dependents. RECOVERY_REQUIRED can never satisfy
         readiness: an unproven side effect is not a success.
+
+        Delegates to the module-level ``_recorded_success`` so the
+        detail-side status derivation (5.2-c) and dependency readiness
+        can never disagree about what counts as a success.
         """
-        result = step.result
-        return (
-            result is not None
-            and result.success
-            and step.status
-            in {PlanStepStatus.COMPLETED, PlanStepStatus.EXECUTED}
-        )
+        return _recorded_success(step)
 
     def ready_step_ids(
         self, plan_id: str, owner_id: str, session_id: str

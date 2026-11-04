@@ -9,9 +9,13 @@ advances a sequence automatically. A step is requested at most once:
 COMPLETED, EXECUTED, and FAILED are final states. A failed, rejected,
 expired, or unavailable step cannot be re-requested; address the cause
 and capture a new plan via a new chat turn instead.
+
+Phase 5.2-a adds a read-only plan inventory (GET /api/plans) that
+derives advisory attention flags from persisted state; the listing
+never reconciles approvals or mutates step status.
 """
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -21,30 +25,100 @@ from app.core.security import (
     require_safe_origin,
 )
 from app.schemas.approval import ApprovalRequest
-from app.schemas.plan import TaskPlan
+from app.schemas.plan import PlanDetail, PlanListResponse, PlanSummary, TaskPlan
 from app.schemas.tool import ToolResult
 from app.services.approval_service import ApprovalArgumentsError, ApprovalWorkflowError
 from app.services.approval_store import ApprovalCapacityError
 from app.services.plan_service import (
+    PlanCorruptError,
     PlanNotFoundError,
     PlanStepNotFoundError,
     PlanStepStateError,
+    derive_plan_status,
     plan_service,
+    summarize_plan_steps,
 )
 from app.services.tool_registry import UnknownToolError
 
 
 router = APIRouter(tags=["plans"])
 
+# Plan inventory pagination policy (Phase 5.2-a): newest creation first
+# with a deterministic plan_id tiebreak, mirroring the conversation
+# listing policy approved in Phase 5.1.
+DEFAULT_PLAN_LIST_LIMIT = 50
+MAX_PLAN_LIST_LIMIT = 200
 
-@router.get("/api/plans/{plan_id}", response_model=TaskPlan, status_code=200)
+
+@router.get("/api/plans", response_model=PlanListResponse, status_code=200)
+async def list_plans(
+    principal: AuthenticatedSession = Depends(require_authenticated_session),
+    limit: int = Query(
+        default=DEFAULT_PLAN_LIST_LIMIT,
+        ge=1,
+        le=MAX_PLAN_LIST_LIMIT,
+        description="Page size (1..200)",
+    ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="Page offset into the deterministic ordering",
+    ),
+) -> PlanListResponse:
+    """List the authenticated identity's plans (metadata only).
+
+    Strictly read-only: statuses and attention flags describe plans
+    exactly as persisted — no reconcile, no state transition, no
+    approval side effect. Ordering is ``created_at DESC, plan_id DESC``
+    and page rows plus ``total`` come from ONE consistent storage
+    transaction. A corrupted persisted plan fails closed with a
+    structured 500 instead of being served or skipped.
+    """
+    try:
+        views, total = plan_service.list_plans_page(
+            owner_id=principal.owner_id,
+            session_id=principal.session_id,
+            limit=limit,
+            offset=offset,
+        )
+    except PlanCorruptError:
+        raise StarletteHTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Plan state could not be validated.",
+        )
+    return PlanListResponse(
+        plans=[
+            PlanSummary(
+                plan_id=view.plan_id,
+                goal=view.plan.goal,
+                created_at=view.created_at,
+                updated_at=view.updated_at,
+                step_count=len(view.plan.steps),
+                **summarize_plan_steps(view.plan),
+            )
+            for view in views
+        ],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/api/plans/{plan_id}", response_model=PlanDetail, status_code=200)
 async def get_plan(
     plan_id: str,
     principal: AuthenticatedSession = Depends(require_authenticated_session),
-) -> TaskPlan:
-    """Return the authenticated session's plan after approval reconciliation."""
+) -> PlanDetail:
+    """Return the session's plan after approval reconciliation.
+
+    The authoritative read: approval-driven states are reconciled on
+    read and deterministic derived status is added (overall_status,
+    ready_step_ids, attention lists — Phase 5.2-c). A corrupted
+    persisted plan fails closed with a structured 500; unknown and
+    foreign plans observe 404, never the record's state.
+    """
     try:
-        return plan_service.get_plan(
+        plan = plan_service.get_plan(
             plan_id, principal.owner_id, principal.session_id
         )
     except PlanNotFoundError as exc:
@@ -52,6 +126,15 @@ async def get_plan(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         )
+    except PlanCorruptError:
+        raise StarletteHTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Plan state could not be validated.",
+        )
+    return PlanDetail(
+        **plan.model_dump(),
+        **derive_plan_status(plan),
+    )
 
 
 @router.post(

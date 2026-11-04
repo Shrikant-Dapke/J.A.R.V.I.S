@@ -12,7 +12,11 @@ from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.approval_service import ApprovalArgumentsError, ApprovalWorkflowError
 from app.services.approval_store import ApprovalCapacityError
 from app.services.chat_service import get_chat_response
-from app.services.conversation_store import ConversationNotFoundError
+from app.services.conversation_store import (
+    ConversationCapacityError,
+    ConversationCorruptError,
+    ConversationNotFoundError,
+)
 from app.services.orchestrator import (
     OrchestrationInstructionBudgetError,
     OrchestrationInvalidProposalError,
@@ -64,6 +68,16 @@ async def chat(
         raise StarletteHTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation was not found",
+        )
+    except ConversationCapacityError:
+        raise StarletteHTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The conversation store has reached its configured capacity.",
+        )
+    except ConversationCorruptError:
+        raise StarletteHTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Conversation history could not be validated.",
         )
     except OrchestrationInvalidProposalError:
         raise StarletteHTTPException(
