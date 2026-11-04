@@ -1,0 +1,2566 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "JARVIS",
+    "description": "JARVIS - Just A Rather Very Intelligent System",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/chat": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Chat",
+        "description": "Accept a chat message and return the orchestrator-driven response.\n\nFlow: authentication -> origin validation -> validation -> route ->\norchestrator -> structured response. Conversations are called in\nunder the authenticated owner/session; provider failures map to the\nexisting structured errors without leaking internals.\n\nOrchestration additions:\n\n- A rejected model proposal (unknown tool, malformed decision or\n  arguments, invalid plan) maps to 422; nothing executes.\n- A message too large for the orchestrator instruction budget also\n  maps to 422 and is never silently truncated.\n- A policy-denied tool proposal maps to 403 (fail closed).\n- An unavailable approval store maps to 503 (fail closed, nothing\n  executes).",
+        "operationId": "chat_api_chat_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations": {
+      "get": {
+        "tags": [
+          "conversations"
+        ],
+        "summary": "List Conversations",
+        "description": "List the authenticated identity's conversations (metadata only).\n\nOrdering is ``updated_at DESC, conversation_id DESC``: paginating\nagain returns the same rows in the same order unless state changed,\nand the most recently active conversation is always the first entry\nof page one. The page and ``total`` come from ONE consistent\nstorage transaction.",
+        "operationId": "list_conversations_api_conversations_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "Page size (1..200)",
+              "default": 50,
+              "title": "Limit"
+            },
+            "description": "Page size (1..200)"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Page offset into the deterministic ordering",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Page offset into the deterministic ordering"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/conversations/{conversation_id}": {
+      "get": {
+        "tags": [
+          "conversations"
+        ],
+        "summary": "Get Conversation",
+        "description": "Return the session's most recent turns and the persisted total.\n\n``limit`` windows the view to the most recent turns (backward\ncompatible: the default of 100 behaves exactly like the previous\nfull-history endpoint for conversations with at most 100 turns).\nStored history itself is never modified by reading.",
+        "operationId": "get_conversation_api_conversations__conversation_id__get",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 400,
+              "minimum": 1,
+              "description": "Most recent turns to return (1..400); still in chronological order",
+              "default": 100,
+              "title": "Limit"
+            },
+            "description": "Most recent turns to return (1..400); still in chronological order"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationHistoryResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "conversations"
+        ],
+        "summary": "Delete Conversation",
+        "description": "Delete the authenticated session's conversation from the store.",
+        "operationId": "delete_conversation_api_conversations__conversation_id__delete",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConversationClearResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/approvals": {
+      "get": {
+        "tags": [
+          "approvals"
+        ],
+        "summary": "List Approvals",
+        "description": "List the authenticated identity's approval records (metadata only).\n\nStrictly read-only: no cleanup, no lazy expiration, no claim, no\nstate transition. Statuses are persisted verbatim (advisory), the\nordering is ``created_at DESC, approval_id DESC``, and page rows\nplus ``total`` come from ONE consistent storage transaction. Raw\narguments, digests, and retention flags are never included. A\ncorrupted persisted record fails closed with a structured 500.",
+        "operationId": "list_approvals_api_approvals_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "Page size (1..200)",
+              "default": 50,
+              "title": "Limit"
+            },
+            "description": "Page size (1..200)"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Page offset into the deterministic ordering",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Page offset into the deterministic ordering"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/approvals/{approval_id}": {
+      "get": {
+        "tags": [
+          "approvals"
+        ],
+        "summary": "Get Approval",
+        "description": "Return the current state, applying lazy expiration.\n\nA corrupted persisted record fails closed with a structured 500\ncarrying a fixed, non-sensitive message (Phase 5.2-c): unknown and\nforeign approvals still observe 404 and never the record's state.",
+        "operationId": "get_approval_api_approvals__approval_id__get",
+        "parameters": [
+          {
+            "name": "approval_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Approval Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalRequest"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/approvals/{approval_id}/approve": {
+      "post": {
+        "tags": [
+          "approvals"
+        ],
+        "summary": "Approve Approval",
+        "description": "Approve and consume one exact request before executing it.",
+        "operationId": "approve_approval_api_approvals__approval_id__approve_post",
+        "parameters": [
+          {
+            "name": "approval_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Approval Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/approvals/{approval_id}/reject": {
+      "post": {
+        "tags": [
+          "approvals"
+        ],
+        "summary": "Reject Approval",
+        "description": "Reject one pending request without invoking the executor.",
+        "operationId": "reject_approval_api_approvals__approval_id__reject_post",
+        "parameters": [
+          {
+            "name": "approval_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Approval Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalRequest"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/system-info": {
+      "get": {
+        "tags": [
+          "tools"
+        ],
+        "summary": "System Info",
+        "description": "Invoke the read-only get_system_info stub through the tool boundary.\n\nThe route contains no tool implementation logic.",
+        "operationId": "system_info_api_system_info_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ToolResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/tools/{name}/invoke": {
+      "post": {
+        "tags": [
+          "tools"
+        ],
+        "summary": "Invoke Tool",
+        "description": "Validate -> registry lookup -> policy decision -> execution boundary.\n\nOnly policy-allowed tools reach the executor. Arguments are accepted as\nbounded structured data and validated by the selected tool.",
+        "operationId": "invoke_tool_api_tools__name__invoke_post",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ToolInvokeRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Request"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ToolResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApprovalRequest"
+                    }
+                  ],
+                  "title": "Response Invoke Tool Api Tools  Name  Invoke Post"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalRequest"
+                }
+              }
+            },
+            "description": "Accepted"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/plans": {
+      "get": {
+        "tags": [
+          "plans"
+        ],
+        "summary": "List Plans",
+        "description": "List the authenticated identity's plans (metadata only).\n\nStrictly read-only: statuses and attention flags describe plans\nexactly as persisted \u2014 no reconcile, no state transition, no\napproval side effect. Ordering is ``created_at DESC, plan_id DESC``\nand page rows plus ``total`` come from ONE consistent storage\ntransaction. A corrupted persisted plan fails closed with a\nstructured 500 instead of being served or skipped.",
+        "operationId": "list_plans_api_plans_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "description": "Page size (1..200)",
+              "default": 50,
+              "title": "Limit"
+            },
+            "description": "Page size (1..200)"
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Page offset into the deterministic ordering",
+              "default": 0,
+              "title": "Offset"
+            },
+            "description": "Page offset into the deterministic ordering"
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/plans/{plan_id}": {
+      "get": {
+        "tags": [
+          "plans"
+        ],
+        "summary": "Get Plan",
+        "description": "Return the session's plan after approval reconciliation.\n\nThe authoritative read: approval-driven states are reconciled on\nread and deterministic derived status is added (overall_status,\nready_step_ids, attention lists \u2014 Phase 5.2-c). A corrupted\npersisted plan fails closed with a structured 500; unknown and\nforeign plans observe 404, never the record's state.",
+        "operationId": "get_plan_api_plans__plan_id__get",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Plan Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlanDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/plans/{plan_id}/steps/{step_id}/request": {
+      "post": {
+        "tags": [
+          "plans"
+        ],
+        "summary": "Request Plan Step",
+        "description": "Request one ready plan step through policy and the approval workflow.\n\nRead-only tools execute once and resolve the step. Mutating tools\nreturn a pending exact-argument approval (202) and execute nothing\nhere. No automatic advancement happens for other steps.",
+        "operationId": "request_plan_step_api_plans__plan_id__steps__step_id__request_post",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Plan Id"
+            }
+          },
+          {
+            "name": "step_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Step Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ToolResult"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ApprovalRequest"
+                    }
+                  ],
+                  "title": "Response Request Plan Step Api Plans  Plan Id  Steps  Step Id  Request Post"
+                }
+              }
+            }
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApprovalRequest"
+                }
+              }
+            },
+            "description": "Accepted"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/plans/{plan_id}/steps/{step_id}/resolve-recovery": {
+      "post": {
+        "tags": [
+          "plans"
+        ],
+        "summary": "Resolve Plan Step Recovery",
+        "description": "Explicitly reconcile a RECOVERY_REQUIRED step.\n\nApproval-driven automatic execution never resolves uncertain steps:\nwhether the side effect occurred cannot be proven by the backend, so\na human acknowledges the uncertainty here. The step resolves FAILED\nwith an ``execution_uncertain`` classification and the standing\nmutation boundary attempt is finalized RECONCILED. The user must\nverify any external effect manually; dependents stay blocked either\nway until a new plan captures the follow-up work.",
+        "operationId": "resolve_plan_step_recovery_api_plans__plan_id__steps__step_id__resolve_recovery_post",
+        "parameters": [
+          {
+            "name": "plan_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Plan Id"
+            }
+          },
+          {
+            "name": "step_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Step Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          },
+          {
+            "name": "X-JARVIS-Token",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Token"
+            }
+          },
+          {
+            "name": "X-JARVIS-Session",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Jarvis-Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskPlan"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/health": {
+      "get": {
+        "tags": [
+          "health"
+        ],
+        "summary": "Health Check",
+        "description": "Health check endpoint.\n\nReturns:\n    JSON response with application name, status, and version.",
+        "operationId": "health_check_api_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/": {
+      "get": {
+        "tags": [
+          "root"
+        ],
+        "summary": "Root",
+        "description": "Root endpoint.",
+        "operationId": "root__get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApprovalListResponse": {
+        "properties": {
+          "approvals": {
+            "items": {
+              "$ref": "#/components/schemas/ApprovalSummary"
+            },
+            "type": "array",
+            "title": "Approvals",
+            "description": "Approvals ordered by creation, newest first"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total non-purged approvals for the identity"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "description": "Page size actually applied"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset",
+            "description": "Offset actually applied"
+          }
+        },
+        "type": "object",
+        "required": [
+          "approvals",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "ApprovalListResponse",
+        "description": "Metadata page for the authenticated identity's approval records."
+      },
+      "ApprovalRequest": {
+        "properties": {
+          "approval_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Approval Id",
+            "description": "Unique approval request identifier"
+          },
+          "tool_name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_]+$",
+            "title": "Tool Name"
+          },
+          "arguments": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Arguments",
+            "description": "Validated arguments bound to this approval"
+          },
+          "action_description": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Action Description"
+          },
+          "risk_level": {
+            "$ref": "#/components/schemas/RiskLevel"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ApprovalStatus",
+            "default": "PENDING"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "approval_id",
+          "tool_name",
+          "action_description",
+          "risk_level",
+          "expires_at"
+        ],
+        "title": "ApprovalRequest",
+        "description": "Exact, bounded action waiting for explicit user approval."
+      },
+      "ApprovalStatus": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "APPROVED",
+          "REJECTED",
+          "EXPIRED",
+          "EXECUTED"
+        ],
+        "title": "ApprovalStatus",
+        "description": "Approval lifecycle states, including the single-use terminal state."
+      },
+      "ApprovalSummary": {
+        "properties": {
+          "approval_id": {
+            "type": "string",
+            "title": "Approval Id",
+            "description": "Approval request identifier"
+          },
+          "tool_name": {
+            "type": "string",
+            "title": "Tool Name",
+            "description": "Tool the approval guards"
+          },
+          "action_description": {
+            "type": "string",
+            "title": "Action Description",
+            "description": "Human-readable description of the guarded action"
+          },
+          "risk_level": {
+            "$ref": "#/components/schemas/RiskLevel",
+            "description": "Risk classification of the action"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ApprovalStatus",
+            "description": "Persisted lifecycle status (verbatim, advisory: expiration is applied on authoritative detail reads, not by this listing)"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Creation timestamp (UTC)"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At",
+            "description": "Absolute expiration timestamp (UTC)"
+          },
+          "resolved_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resolved At",
+            "description": "Resolution timestamp (UTC) once the request is terminal"
+          }
+        },
+        "type": "object",
+        "required": [
+          "approval_id",
+          "tool_name",
+          "action_description",
+          "risk_level",
+          "status",
+          "created_at",
+          "expires_at"
+        ],
+        "title": "ApprovalSummary",
+        "description": "One approval's inventory metadata for the authenticated identity.\n\nMetadata only: derived from the strictly validated persisted record\nwith raw execution arguments structurally dropped. Integrity\ndigests, retention (purged) flags, and identity fields never appear\nhere; the authenticated detail endpoint remains the only way to\nfetch the exact approved request, including its arguments."
+      },
+      "ChatRequest": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Message",
+            "description": "User message"
+          },
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id",
+            "description": "Optional conversation identifier"
+          }
+        },
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "title": "ChatRequest",
+        "description": "Chat request contract."
+      },
+      "ChatResponse": {
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "title": "Conversation Id",
+            "description": "Conversation identifier"
+          },
+          "response": {
+            "type": "string",
+            "title": "Response",
+            "description": "Assistant response"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "success",
+              "action_proposed",
+              "plan_proposed"
+            ],
+            "title": "Status",
+            "description": "Response status",
+            "default": "success"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp",
+            "description": "Response timestamp (UTC)"
+          },
+          "action": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProposedAction"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pending approval payload when status is action_proposed"
+          },
+          "tool_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExecutedAction"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Structured outcome when a read-only tool was executed"
+          },
+          "plan": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TaskPlan"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Captured plan payload when status is plan_proposed"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversation_id",
+          "response"
+        ],
+        "title": "ChatResponse",
+        "description": "Chat response contract.\n\nBackward compatible with the Phase 2/3 contract:\n\n- ``status=\"success\"`` \u2014 a conversational reply (optionally with the\n  structured outcome of an auto-executed read-only tool in\n  ``tool_result``).\n- ``status=\"action_proposed\"`` \u2014 a mutating action was proposed;\n  ``action`` carries the exact pending approval. Nothing executed.\n- ``status=\"plan_proposed\"`` \u2014 a validated multi-step plan was\n  captured; ``plan`` carries the steps. Nothing executed."
+      },
+      "ConversationClearResponse": {
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "title": "Conversation Id",
+            "description": "Deleted conversation identifier"
+          },
+          "status": {
+            "type": "string",
+            "const": "deleted",
+            "title": "Status",
+            "description": "Deletion status",
+            "default": "deleted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversation_id"
+        ],
+        "title": "ConversationClearResponse",
+        "description": "Conversation deletion confirmation."
+      },
+      "ConversationHistoryResponse": {
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "title": "Conversation Id",
+            "description": "Conversation identifier"
+          },
+          "turns": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationTurn"
+            },
+            "type": "array",
+            "title": "Turns",
+            "description": "Chronological turns"
+          },
+          "turn_count": {
+            "type": "integer",
+            "title": "Turn Count",
+            "description": "Number of turns in THIS response (windowed views may be smaller than the stored total)"
+          },
+          "total_turn_count": {
+            "type": "integer",
+            "title": "Total Turn Count",
+            "description": "Total turns persisted for the conversation"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversation_id",
+          "turns",
+          "turn_count",
+          "total_turn_count"
+        ],
+        "title": "ConversationHistoryResponse",
+        "description": "Ordered conversation history contract."
+      },
+      "ConversationListResponse": {
+        "properties": {
+          "conversations": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationSummary"
+            },
+            "type": "array",
+            "title": "Conversations",
+            "description": "Conversations ordered by most recent activity"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total conversations for the authenticated identity"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "description": "Page size actually applied"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset",
+            "description": "Offset actually applied"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversations",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "ConversationListResponse",
+        "description": "Metadata page for the authenticated identity's conversations."
+      },
+      "ConversationSummary": {
+        "properties": {
+          "conversation_id": {
+            "type": "string",
+            "title": "Conversation Id",
+            "description": "Conversation identifier"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Creation timestamp (UTC)"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At",
+            "description": "Timestamp of the last stored turn (UTC)"
+          },
+          "turn_count": {
+            "type": "integer",
+            "title": "Turn Count",
+            "description": "Total turns stored"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversation_id",
+          "created_at",
+          "updated_at",
+          "turn_count"
+        ],
+        "title": "ConversationSummary",
+        "description": "One conversation's metadata (never message content)."
+      },
+      "ConversationTurn": {
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant"
+            ],
+            "title": "Role",
+            "description": "Turn role"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content",
+            "description": "Turn content"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp",
+            "description": "Turn timestamp (UTC)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "ConversationTurn",
+        "description": "A single conversation turn."
+      },
+      "ExecutedAction": {
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Tool Name"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "success",
+              "already_exists",
+              "failure"
+            ],
+            "title": "Status"
+          },
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Message"
+          },
+          "data": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tool_name",
+          "status",
+          "success",
+          "message"
+        ],
+        "title": "ExecutedAction",
+        "description": "Structured outcome of an already-executed registered tool."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "PlanDetail": {
+        "properties": {
+          "plan_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+            "title": "Plan Id",
+            "description": "Unique plan identifier"
+          },
+          "goal": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Goal",
+            "description": "What the plan is meant to achieve"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PlanStep"
+            },
+            "type": "array",
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Steps",
+            "description": "Bounded, ordered sequence of steps"
+          },
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id",
+            "description": "Optional conversation the plan belongs to"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Plan creation timestamp (UTC)"
+          },
+          "overall_status": {
+            "$ref": "#/components/schemas/PlanOverallStatus",
+            "description": "Derived whole-plan status with precedence recovery_required > awaiting_approval > actionable > failed > in_progress > completed"
+          },
+          "ready_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ready Step Ids",
+            "description": "PENDING step ids whose dependencies all have recorded successful results; the only steps requestable right now"
+          },
+          "recovery_required": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Recovery Required",
+            "description": "Step ids of steps awaiting explicit RECOVERY_REQUIRED reconciliation"
+          },
+          "awaiting_approval": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Awaiting Approval",
+            "description": "Step ids of steps still awaiting an approval decision"
+          },
+          "needs_attention": {
+            "type": "boolean",
+            "title": "Needs Attention",
+            "description": "True while any step is RECOVERY_REQUIRED or AWAITING_APPROVAL; a plan with unresolved recovery work is never presented as safe"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan_id",
+          "goal",
+          "steps",
+          "overall_status",
+          "ready_step_ids",
+          "recovery_required",
+          "awaiting_approval",
+          "needs_attention"
+        ],
+        "title": "PlanDetail",
+        "description": "The authoritative plan detail plus deterministic derived status.\n\nEverything from ``TaskPlan`` is served by the existing fields; the\nfive added fields are derived on read by\n``plan_service.derive_plan_status`` from persisted step state and\nare never persisted. The listing-side summary (``PlanSummary``)\nexposes the same attention flags generated by\n``summarize_plan_steps``; the detail is the authoritative read that\nalso reconciles approval-driven states."
+      },
+      "PlanListResponse": {
+        "properties": {
+          "plans": {
+            "items": {
+              "$ref": "#/components/schemas/PlanSummary"
+            },
+            "type": "array",
+            "title": "Plans",
+            "description": "Plans ordered by creation, newest first"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "description": "Total plans for the authenticated identity"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit",
+            "description": "Page size actually applied"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset",
+            "description": "Offset actually applied"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plans",
+          "total",
+          "limit",
+          "offset"
+        ],
+        "title": "PlanListResponse",
+        "description": "Metadata page for the authenticated identity's plans."
+      },
+      "PlanOverallStatus": {
+        "type": "string",
+        "enum": [
+          "recovery_required",
+          "awaiting_approval",
+          "actionable",
+          "failed",
+          "in_progress",
+          "completed"
+        ],
+        "title": "PlanOverallStatus",
+        "description": "Deterministic derived status of a whole plan (5.2-c precedence):\n\nrecovery_required > awaiting_approval > actionable > failed >\nin_progress > completed. The precedence resolves the WORST\noutstanding state for mixed plans; see\n``plan_service.derive_plan_status`` for the exact rules."
+      },
+      "PlanStep": {
+        "properties": {
+          "step_id": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_]{1,32}$",
+            "title": "Step Id",
+            "description": "Plan-unique step identifier"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Description",
+            "description": "Human-readable description of the step"
+          },
+          "tool_name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_]+$",
+            "title": "Tool Name",
+            "description": "Registered tool executed by this step"
+          },
+          "arguments": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Arguments",
+            "description": "Bounded string arguments for the step tool"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Depends On",
+            "description": "Earlier step_ids that must complete first"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PlanStepStatus",
+            "default": "PENDING"
+          },
+          "approval_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Id",
+            "description": "Exact approval bound to this step, if any"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Resolved execution result, once the step ran"
+          }
+        },
+        "type": "object",
+        "required": [
+          "step_id",
+          "description",
+          "tool_name"
+        ],
+        "title": "PlanStep",
+        "description": "One bounded step inside a validated task plan."
+      },
+      "PlanStepStatus": {
+        "type": "string",
+        "enum": [
+          "PENDING",
+          "AWAITING_APPROVAL",
+          "RECOVERY_REQUIRED",
+          "COMPLETED",
+          "EXECUTED",
+          "FAILED"
+        ],
+        "title": "PlanStepStatus",
+        "description": "Lifecycle of one plan step.\n\nCOMPLETED means a successful policy-allowed execution whose\nToolResult is recorded on the step; EXECUTED means an approved\naction ran successfully and its ToolResult was recorded by the\napproval-outcome listener. FAILED covers every other terminal\noutcome and always carries its recorded result. Only recorded\noutcomes count for dependency readiness \u2014 status alone never proves\nsuccess.\n\nRECOVERY_REQUIRED marks a mutating step whose outcome could not be\nproven (e.g. the process died after the tool started, or a mutating\nexecution exceeded its time budget). It is deliberately NOT\nterminal: whether the side effect occurred is unknown, so automatic\nreporting of success or failure would be dishonest. It resolves only\nthrough explicit reconciliation (resolve-recovery endpoint) to a\nFAILED step with an ``execution_uncertain`` result, and it can never\nsatisfy dependency readiness."
+      },
+      "PlanSummary": {
+        "properties": {
+          "plan_id": {
+            "type": "string",
+            "title": "Plan Id",
+            "description": "Plan identifier"
+          },
+          "goal": {
+            "type": "string",
+            "title": "Goal",
+            "description": "What the plan is meant to achieve"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Creation timestamp (UTC)"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At",
+            "description": "Timestamp of the last persisted plan change (UTC)"
+          },
+          "step_count": {
+            "type": "integer",
+            "title": "Step Count",
+            "description": "Number of steps in the plan"
+          },
+          "status_counts": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object",
+            "title": "Status Counts",
+            "description": "Step count per step status present in the plan"
+          },
+          "recovery_required": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Recovery Required",
+            "description": "Step ids of steps awaiting explicit RECOVERY_REQUIRED reconciliation"
+          },
+          "awaiting_approval": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Awaiting Approval",
+            "description": "Step ids of steps still awaiting an approval decision"
+          },
+          "needs_attention": {
+            "type": "boolean",
+            "title": "Needs Attention",
+            "description": "True while any step is RECOVERY_REQUIRED or AWAITING_APPROVAL; a plan with unresolved recovery work is never presented as safe"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan_id",
+          "goal",
+          "created_at",
+          "updated_at",
+          "step_count",
+          "status_counts",
+          "recovery_required",
+          "awaiting_approval",
+          "needs_attention"
+        ],
+        "title": "PlanSummary",
+        "description": "One plan's inventory metadata for the authenticated identity.\n\nDerived directly from persisted plan state (advisory flags until an\nauthoritative detail read); never includes step arguments, results,\napproval identities beyond ordering, or owner/session fields."
+      },
+      "ProposedAction": {
+        "properties": {
+          "approval_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Approval Id"
+          },
+          "tool_name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Tool Name"
+          },
+          "arguments": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Arguments",
+            "description": "Exact validated arguments the approval is bound to"
+          },
+          "action_description": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Action Description"
+          },
+          "risk_level": {
+            "$ref": "#/components/schemas/RiskLevel"
+          },
+          "approval_status": {
+            "$ref": "#/components/schemas/ApprovalStatus"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "approval_id",
+          "tool_name",
+          "action_description",
+          "risk_level",
+          "approval_status",
+          "expires_at"
+        ],
+        "title": "ProposedAction",
+        "description": "A mutating action waiting for explicit user approval.\n\nReturned when the orchestrator forwarded a proposal through the\nexisting approval workflow and nothing has executed yet."
+      },
+      "RiskLevel": {
+        "type": "string",
+        "enum": [
+          "READ_ONLY",
+          "LOW_RISK",
+          "HIGH_RISK"
+        ],
+        "title": "RiskLevel",
+        "description": "Small, extensible risk classification for registered tools."
+      },
+      "TaskPlan": {
+        "properties": {
+          "plan_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]{1,64}$",
+            "title": "Plan Id",
+            "description": "Unique plan identifier"
+          },
+          "goal": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Goal",
+            "description": "What the plan is meant to achieve"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PlanStep"
+            },
+            "type": "array",
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Steps",
+            "description": "Bounded, ordered sequence of steps"
+          },
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Conversation Id",
+            "description": "Optional conversation the plan belongs to"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At",
+            "description": "Plan creation timestamp (UTC)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "plan_id",
+          "goal",
+          "steps"
+        ],
+        "title": "TaskPlan",
+        "description": "A bounded, validated sequence of tool steps proposed for one goal."
+      },
+      "ToolInvokeRequest": {
+        "properties": {
+          "arguments": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments",
+            "description": "Optional bounded string arguments (no code or commands)"
+          }
+        },
+        "type": "object",
+        "title": "ToolInvokeRequest",
+        "description": "Typed invocation request (structured arguments only)."
+      },
+      "ToolResult": {
+        "properties": {
+          "tool_name": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_]+$",
+            "title": "Tool Name",
+            "description": "Registered tool name"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "success",
+              "already_exists",
+              "failure"
+            ],
+            "title": "Status",
+            "description": "Execution status"
+          },
+          "success": {
+            "type": "boolean",
+            "title": "Success",
+            "description": "Whether the requested operation completed",
+            "default": true
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Message",
+            "description": "Safe human-readable result message",
+            "default": "Tool execution completed."
+          },
+          "data": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data",
+            "description": "Bounded structured output from the tool"
+          },
+          "payload": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Payload",
+            "description": "Bounded string payload (keys/values length-limited)"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 512
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error",
+            "description": "Safe error message (no internals)"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 64,
+                "pattern": "^[a-zA-Z0-9_]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code",
+            "description": "Stable, non-sensitive error classification"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Timestamp",
+            "description": "Result timestamp (UTC)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "tool_name",
+          "status"
+        ],
+        "title": "ToolResult",
+        "description": "Bounded, user-safe result returned by a tool invocation.\n\n``payload`` is retained for the Phase 1 API contract. New code should use\n``data`` as the structured output field; tool factories populate both with\nthe same bounded values while the contract settles."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

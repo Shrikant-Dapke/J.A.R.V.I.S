@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-void text-slate-200 font-display antialiased;
+  }
+  ::selection {
+    @apply bg-accent/30 text-white;
+  }
+}
+
+@layer components {
+  /* Layered HUD backdrop: vignette + cyan/violet blooms + faint grid. */
+  .hud-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      radial-gradient(900px 480px at 12% -10%, rgba(34, 211, 238, 0.09), transparent 60%),
+      radial-gradient(760px 420px at 96% 8%, rgba(167, 139, 250, 0.07), transparent 62%),
+      radial-gradient(1100px 700px at 50% 118%, rgba(34, 211, 238, 0.05), transparent 65%),
+      linear-gradient(rgba(148, 163, 184, 0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(148, 163, 184, 0.035) 1px, transparent 1px);
+    background-size:
+      auto, auto, auto, 48px 48px, 48px 48px;
+  }
+
+  .panel {
+    @apply rounded-xl border border-line/80 bg-abyss/80 shadow-[0_18px_40px_-24px_rgba(2,6,23,0.9)] backdrop-blur-sm;
+  }
+  .panel-inner {
+    @apply rounded-lg border border-line/60 bg-hull/40;
+  }
+
+  .hairline {
+    @apply border border-line/80;
+  }
+
+  .kv-key {
+    @apply font-mono text-[11px] uppercase tracking-[0.14em] text-slate-500;
+  }
+  .kv-value {
+    @apply break-all font-mono text-[13px] text-slate-200;
+  }
+
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70 focus-visible:ring-offset-2 focus-visible:ring-offset-void;
+  }
+
+  .scroll-hud {
+    @apply overflow-y-auto pr-2;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(34, 211, 238, 0.35) transparent;
+  }
+  .scroll-hud::-webkit-scrollbar {
+    width: 8px;
+  }
+  .scroll-hud::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-accent/25;
+  }
+  .scroll-hud::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}

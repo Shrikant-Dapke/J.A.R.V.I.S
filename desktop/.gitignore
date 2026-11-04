@@ -1,0 +1,13 @@
+node_modules/
+dist/
+dist-test/
+.vite/
+
+# Local-only environment / secrets — never commit.
+.env
+.env.*
+
+# Logs / OS noise
+npm-debug.log*
+.DS_Store
+Thumbs.db

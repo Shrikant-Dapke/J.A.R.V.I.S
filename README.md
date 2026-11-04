@@ -374,3 +374,13 @@ handling (`RECOVERY_REQUIRED` + explicit reconciliation), and idempotent
 startup recovery. Backend foundation, LLM providers (fake / gemini /
 ollama), and the policy–approval–execution stack are complete and
 covered by the test suite.
+
+## Desktop app (Phase 6.1)
+
+An Electron + React + TypeScript + Vite + Tailwind desktop shell now lives in
+[desktop/](desktop/README.md). Its renderer has no network access: every
+backend call runs in the Electron main process over a narrow typed IPC
+bridge (jarvis:* channels), authentication never crosses the bridge, and
+the backend's loopback-only / approval-gated boundaries are preserved
+unchanged. See desktop/README.md for setup, security model, and the IPC
+contract; run the acceptance gate with `npm run verify` inside `desktop/`.
