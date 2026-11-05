@@ -1,4 +1,4 @@
-# JARVIS Desktop (Phase 6.2 — Functional Chat)
+# JARVIS Desktop (Phase 6.3 — Plans & Approval Center)
 
 Electron desktop shell for J.A.R.V.I.S. The renderer has **no network access**:
 every backend call runs in the Electron main process over a narrow, typed IPC
@@ -107,6 +107,14 @@ the registry, the preload, the renderer, and the tests:
 | `listConversations`  | `jarvis:list-conversations`   | `{ limit? ≤200, offset? }`                   | `ConversationListView`      |
 | `getConversation`    | `jarvis:get-conversation`     | `{ conversationId }` (uuid)                  | `ConversationHistoryView`   |
 | `deleteConversation` | `jarvis:delete-conversation`  | `{ conversationId }` (uuid)                  | `ConversationDeletedView`   |
+| `listApprovals`      | `jarvis:list-approvals`       | `{ limit? ≤200, offset? }`                   | `ApprovalListView`          |
+| `getApproval`        | `jarvis:get-approval`         | `{ approvalId }` (uuid)                      | `ApprovalRequestView`       |
+| `approveApproval`    | `jarvis:approve-approval`     | `{ approvalId }` (uuid)                      | `ToolExecutionView`         |
+| `rejectApproval`     | `jarvis:reject-approval`      | `{ approvalId }` (uuid)                      | `ApprovalRequestView`       |
+| `listPlans`          | `jarvis:list-plans`           | `{ limit? ≤200, offset? }`                   | `PlanListView`              |
+| `getPlan`            | `jarvis:get-plan`             | `{ planId }` (`^[a-zA-Z0-9_-]{1,64}$`)       | `PlanDetailView`            |
+| `requestPlanStep`    | `jarvis:request-plan-step`    | `{ planId, stepId }` (patterned)             | `PlanStepRequestOutcomeView`|
+| `resolvePlanRecovery`| `jarvis:resolve-plan-recovery`| `{ planId, stepId }` (patterned)             | `PlanRecoveryResolvedView`  |
 
 Every channel declares a validator in `PAYLOAD_VALIDATORS`; the registry
 rejects anything the validator refuses (`BAD_PAYLOAD`) before a handler runs.
@@ -140,7 +148,7 @@ route, unauthenticated health/root, schema presence).
 | `test` 🔎              | compile pure modules → `node --test` contract suite             |
 | `verify`               | typecheck + test + build (the acceptance gate)                  |
 
-Tests (71) run in plain Node against the compiled **pure** modules — no
+Tests (93) run in plain Node against the compiled **pure** modules — no
 Electron runtime needed. Electron glue (`main.ts`, `handlers.ts`, preload) is
 kept thin on purpose so everything security-relevant is testable.
 
@@ -161,9 +169,8 @@ Dark futuristic HUD shell (`src/renderer`):
 - Live data: `useBackendMonitor` (status + health, 30 s poll, manual refresh)
   and `useSystemInfo` (auth-gated `get_system_info` tool read).
 
-Phase 6.1 scope is honest by design: the Approvals and Plans surfaces are
-explicit placeholders that state their Phase 6.3 contracts — no fake data,
-no streaming, no voice, no non-functional controls.
+Phase 6.2 scope was honest by design: the Approvals and Plans surfaces were
+placeholders until Phase 6.3 wired them. The chat console remains untouched.
 
 ## Chat console (Phase 6.2, fully functional)
 
@@ -200,10 +207,51 @@ bridge:
 Chat sends are blocked with an explicit banner when the token is not
 configured (`tokenConfigured === false` from the main-process status).
 
-## Phase 6.3 backlog (not in this build)
+## Approvals center (Phase 6.3, fully functional)
 
-- Approval workspace: inventory (advisory) → authoritative detail reads →
-  approve/reject single-use, TTL-bound actions; unchanged backend policy.
-- Plans workspace: authoritative plan/steps, one-step-per-request execution,
-  recovery reconciliation.
+The Approvals view is a complete decision workspace over the typed IPC bridge:
+
+- **Inventory rail** — `GET /api/approvals` metadata page (newest first). Rows
+  show tool, risk badge, lifecycle status, creation/resolution time and the
+  description only — arguments are structurally absent from the listing.
+- **Authoritative detail** — selecting a row always fetches
+  `GET /api/approvals/{id}` (the endpoint that also applies lazy expiration),
+  so what the user sees is the backend's current truth: exact bound
+  arguments (read-only), risk explanation, TTL countdown (`expiresAt`),
+  terminal states.
+- **Decisive actions** — Approve/Reject behind explicit in-panel
+  confirmation dialogs. Before a decisive POST, the exact approval is
+  **re-read authoritatively**; the POST goes out only on a fresh read and
+  then exactly **once** — never retried. Duplicate clicks are refused by an
+  in-flight lock plus disabled controls.
+- **Outcome honesty** — an approved execution renders the backend's
+  ToolResult verbatim (status, message, bounded data map, error code) with
+  the single-use receipt; rejects render the authoritative REJECTED state.
+  404/409 conflicts surface the backend message + status meaning and
+  converge by re-reading; terminal states disable the action panel.
+
+## Plans center (Phase 6.3, fully functional)
+
+The Plans view is a complete manual-execution workspace over the typed IPC
+bridge:
+
+- **Overview rail** — `GET /api/plans` metadata page with backend attention
+  flags (`needs_attention`, recovery/awaiting counts, step counts).
+- **Authoritative plan detail** — `GET /api/plans/{id}` rendered verbatim:
+  `overall_status` banner (backend-derived), `ready_step_ids` ready
+  indicators, dependency lists, bound arguments, recorded results. The
+  client **never** computes step eligibility — the backend owns readiness.
+- **Step requests** — one confirmed click = exactly one POST
+  `.../steps/{step}/request`. A read-only step answers 200 with a verbatim
+  ToolResult; a mutating step answers 202 with the created pending approval
+  (nothing executed) surfaced as an "approval required" card pointing to the
+  Approvals workspace. After any attempt the plan is re-read so the UI
+  converges to persisted state.
+- **Recovery reconciliation** — RECOVERY_REQUIRED steps expose an explicit
+  acknowledge flow that states the uncertainty honestly: the backend
+  finalizes the step FAILED (`execution_uncertain`), the side effect must be
+  verified manually, and dependents stay blocked.
+
+## Phase 6.4 backlog (not in this build)
+
 - Packaging (electron-builder), code signing, auto-update policy.

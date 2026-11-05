@@ -13,20 +13,29 @@ import { ipcMain, type IpcMainInvokeEvent } from "electron";
 import { createIpcRegistry, type IpcHandlers, type IpcRegistry } from "./ipc-registry";
 import type { HttpBackendApiClient } from "../api/client";
 import {
+  APPROVALS_TIMEOUT_MS,
+  APPROVAL_ACTION_TIMEOUT_MS,
   DEFAULT_CHAT_TIMEOUT_MS,
   DEFAULT_CONVERSATIONS_TIMEOUT_MS,
   DEFAULT_DELETE_TIMEOUT_MS,
   DEFAULT_HEALTH_TIMEOUT_MS,
   DEFAULT_HISTORY_TIMEOUT_MS,
   DEFAULT_SYSTEM_INFO_TIMEOUT_MS,
+  PLAN_DETAIL_TIMEOUT_MS,
+  PLAN_RECOVERY_TIMEOUT_MS,
+  PLAN_STEP_REQUEST_TIMEOUT_MS,
+  PLANS_TIMEOUT_MS,
 } from "../api/client";
 import {
   ipcOk,
   PRELOAD_METHODS,
+  type ApprovalIdPayload,
   type BackendStatus,
   type ChatSendPayload,
   type ConversationIdPayload,
   type ConversationListPayload,
+  type PlanIdPayload,
+  type PlanStepPayload,
 } from "../../../shared/ipc-contract";
 import { shouldAllowNavigation } from "../app-security";
 
@@ -58,6 +67,22 @@ export function createJarvisIpcRegistry(deps: IpcHandlerDeps): IpcRegistry {
       deps.client.getConversation(payload, DEFAULT_HISTORY_TIMEOUT_MS),
     "jarvis:delete-conversation": async (payload: ConversationIdPayload) =>
       deps.client.deleteConversation(payload, DEFAULT_DELETE_TIMEOUT_MS),
+    "jarvis:list-approvals": async (payload: ConversationListPayload) =>
+      deps.client.listApprovals(payload, APPROVALS_TIMEOUT_MS),
+    "jarvis:get-approval": async (payload: ApprovalIdPayload) =>
+      deps.client.getApproval(payload, APPROVALS_TIMEOUT_MS),
+    "jarvis:approve-approval": async (payload: ApprovalIdPayload) =>
+      deps.client.approveApproval(payload, APPROVAL_ACTION_TIMEOUT_MS),
+    "jarvis:reject-approval": async (payload: ApprovalIdPayload) =>
+      deps.client.rejectApproval(payload, APPROVALS_TIMEOUT_MS),
+    "jarvis:list-plans": async (payload: ConversationListPayload) =>
+      deps.client.listPlans(payload, PLANS_TIMEOUT_MS),
+    "jarvis:get-plan": async (payload: PlanIdPayload) =>
+      deps.client.getPlan(payload, PLAN_DETAIL_TIMEOUT_MS),
+    "jarvis:request-plan-step": async (payload: PlanStepPayload) =>
+      deps.client.requestPlanStep(payload, PLAN_STEP_REQUEST_TIMEOUT_MS),
+    "jarvis:resolve-plan-recovery": async (payload: PlanStepPayload) =>
+      deps.client.resolvePlanRecovery(payload, PLAN_RECOVERY_TIMEOUT_MS),
   };
   return createIpcRegistry(handlers, (url) =>
     shouldAllowNavigation(url ?? "", deps.navigationTrust),

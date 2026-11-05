@@ -202,3 +202,184 @@ test("the generated typed module matches the snapshot", () => {
     assert.ok(generated.includes(marker), `generated types contain ${marker}`);
   }
 });
+
+/* -------------------------------------------------------------------- */
+/* Phase 6.3: approval + plan workspace contract fidelity                */
+/* -------------------------------------------------------------------- */
+
+test("approval listing contract: metadata page without arguments", () => {
+  const spec = loadSpec();
+  const schemas = spec.components.schemas;
+
+  const list = schemas["ApprovalListResponse"] as {
+    required: string[];
+    properties: Record<string, { $ref?: string; items?: { $ref: string }; default?: number }>;
+  };
+  assert.ok(list, "ApprovalListResponse schema present");
+  assert.deepEqual(list.required, ["approvals", "total", "limit", "offset"]);
+  assert.equal(list.properties.approvals.items?.$ref, "#/components/schemas/ApprovalSummary");
+
+  const summary = schemas["ApprovalSummary"] as {
+    required: string[];
+    properties: Record<string, unknown>;
+  };
+  assert.ok(summary, "ApprovalSummary schema present");
+  for (const field of ["approval_id", "tool_name", "action_description", "risk_level", "expires_at"]) {
+    assert.ok(summary.required.includes(field), `ApprovalSummary requires ${field}`);
+  }
+  assert.ok("resolved_at" in summary.properties, "resolved_at is an optional terminal stamp");
+  // The listing is strictly metadata: arguments are structurally absent.
+  assert.ok(
+    "arguments" in summary.properties === false,
+    "ApprovalSummary must not expose arguments",
+  );
+
+  // The authoritative detail binds exactly the validated arguments.
+  const request = schemas["ApprovalRequest"] as {
+    properties: Record<string, { maxProperties?: number; additionalProperties?: { type: string } }>;
+  };
+  const args = request.properties["arguments"];
+  assert.ok(args, "ApprovalRequest carries the bound arguments");
+  const argsProp = args as unknown as {
+    additionalProperties?: { type?: string };
+    maxProperties?: number;
+  };
+  assert.equal(argsProp.additionalProperties?.type, "string");
+  assert.equal(
+    argsProp.maxProperties,
+    undefined,
+    "the arguments ceiling lives in backend validation, not the schema",
+  );
+});
+
+test("plan listing and detail contracts: backend-derived status fields", () => {
+  const spec = loadSpec();
+  const schemas = spec.components.schemas;
+
+  const list = schemas["PlanListResponse"] as { required: string[] };
+  assert.ok(list, "PlanListResponse schema present");
+  assert.deepEqual(list.required, ["plans", "total", "limit", "offset"]);
+
+  const summary = schemas["PlanSummary"] as {
+    required: string[];
+    properties: Record<string, unknown>;
+  };
+  assert.ok(summary, "PlanSummary schema present");
+  for (const field of [
+    "plan_id",
+    "goal",
+    "created_at",
+    "updated_at",
+    "step_count",
+    "status_counts",
+    "recovery_required",
+    "awaiting_approval",
+    "needs_attention",
+  ]) {
+    assert.ok(summary.required.includes(field), `PlanSummary requires ${field}`);
+  }
+
+  const detail = schemas["PlanDetail"] as {
+    required: string[];
+    properties: Record<string, { $ref?: string }>;
+  };
+  assert.ok(detail, "PlanDetail schema present");
+  // Derived status lives on the authoritative read — the client must rely
+  // on these, never compute its own.
+  for (const field of [
+    "overall_status",
+    "ready_step_ids",
+    "recovery_required",
+    "awaiting_approval",
+    "needs_attention",
+    "steps",
+  ]) {
+    assert.ok(detail.required.includes(field), `PlanDetail requires ${field}`);
+  }
+  assert.ok(
+    detail.properties["steps"] !== undefined,
+    "detail steps reference the PlanStep schema",
+  );
+  const stepsProp = detail.properties["steps"] as unknown as {
+    type?: string;
+    maxItems?: number;
+    minItems?: number;
+    items?: { $ref?: string };
+  };
+  assert.equal(stepsProp.type, "array");
+  assert.equal(stepsProp.minItems, 1, "a plan has at least one step");
+  assert.equal(stepsProp.maxItems, 8, "the backend bounds plans at 8 steps");
+  assert.equal(stepsProp.items?.$ref, "#/components/schemas/PlanStep");
+
+  const overall = schemas["PlanOverallStatus"] as { enum?: string[] };
+  assert.ok(overall?.enum, "PlanOverallStatus documents its enum");
+  assert.deepEqual(
+    [...overall.enum].sort(),
+    [
+      "recovery_required",
+      "awaiting_approval",
+      "actionable",
+      "failed",
+      "in_progress",
+      "completed",
+    ].sort(),
+  );
+
+  const step = schemas["PlanStep"] as {
+    required: string[];
+    properties: Record<string, unknown>;
+  };
+  for (const field of ["step_id", "description", "tool_name"]) {
+    assert.ok(step.required.includes(field), `PlanStep requires ${field}`);
+  }
+  for (const field of ["arguments", "depends_on", "status", "approval_id", "result"]) {
+    assert.ok(field in step.properties, `PlanStep documents ${field}`);
+  }
+  assert.ok("approval_id" in step.properties, "PlanStep can reference its approval");
+  assert.ok("result" in step.properties, "PlanStep can record a ToolResult");
+});
+
+test("step request documents the 202 approval branch; recovery returns TaskPlan", () => {
+  const spec = loadSpec();
+
+  type OperationDetail = {
+    responses: Record<
+      string,
+      {
+        content?: Record<string, { schema?: { $ref?: string } }>;
+      }
+    >;
+  };
+
+  const requestOp = spec.paths["/api/plans/{plan_id}/steps/{step_id}/request"]?.post;
+  assert.ok(requestOp, "POST request step must exist");
+  const accepted = (requestOp as unknown as OperationDetail).responses["202"];
+  assert.ok(accepted, "the 202 approval-required branch must be documented");
+  assert.equal(
+    accepted.content?.["application/json"]?.schema?.$ref,
+    "#/components/schemas/ApprovalRequest",
+  );
+
+  const recoveryOp = spec.paths[
+    "/api/plans/{plan_id}/steps/{step_id}/resolve-recovery"
+  ]?.post;
+  assert.ok(recoveryOp, "POST resolve-recovery must exist");
+  assert.equal(
+    (recoveryOp as unknown as OperationDetail).responses["200"].content?.["application/json"]
+      ?.schema?.$ref,
+    "#/components/schemas/TaskPlan",
+  );
+
+  // Identifiers are patterned in the schemas, so path injection cannot
+  // occur client-side without the wire guard refusing it.
+  const detailSchema = spec.components.schemas["PlanDetail"] as {
+    properties: Record<
+      string,
+      { maxLength?: number; minLength?: number; pattern?: string }
+    >;
+  };
+  const planIdProp = detailSchema.properties["plan_id"];
+  assert.ok(planIdProp, "PlanDetail documents plan_id");
+  assert.equal(planIdProp.pattern, "^[a-zA-Z0-9_-]{1,64}$");
+  assert.equal(planIdProp.maxLength, 64);
+});

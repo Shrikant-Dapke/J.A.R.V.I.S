@@ -7,6 +7,10 @@
 
 import {
   IPC_ERROR_COPY,
+  type ApprovalIdPayload,
+  type ApprovalListPayload,
+  type ApprovalListView,
+  type ApprovalRequestView,
   type BackendStatus,
   type ChatExchange,
   type ChatSendPayload,
@@ -19,7 +23,14 @@ import {
   type IpcErrorCode,
   type IpcResult,
   type JarvisApi,
+  type PlanDetailView,
+  type PlanIdPayload,
+  type PlanListView,
+  type PlanRecoveryResolvedView,
+  type PlanStepPayload,
+  type PlanStepRequestOutcomeView,
   type SystemInfoSummary,
+  type ToolExecutionView,
 } from "../../../shared/ipc-contract";
 
 export class UnexpectedBridgeError extends Error {
@@ -107,5 +118,65 @@ export async function deleteConversationById(
   return asIpcResult<ConversationDeletedView>(
     BRIDGE_CONTEXT,
     await resolveBridge().deleteConversation(payload),
+  );
+}
+
+export async function fetchApprovals(
+  payload: ApprovalListPayload = {},
+): Promise<IpcResult<ApprovalListView>> {
+  return asIpcResult<ApprovalListView>(BRIDGE_CONTEXT, await resolveBridge().listApprovals(payload));
+}
+
+export async function fetchApproval(
+  payload: ApprovalIdPayload,
+): Promise<IpcResult<ApprovalRequestView>> {
+  return asIpcResult<ApprovalRequestView>(BRIDGE_CONTEXT, await resolveBridge().getApproval(payload));
+}
+
+export async function approveApprovalById(
+  payload: ApprovalIdPayload,
+): Promise<IpcResult<ToolExecutionView>> {
+  return asIpcResult<ToolExecutionView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().approveApproval(payload),
+  );
+}
+
+export async function rejectApprovalById(
+  payload: ApprovalIdPayload,
+): Promise<IpcResult<ApprovalRequestView>> {
+  return asIpcResult<ApprovalRequestView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().rejectApproval(payload),
+  );
+}
+
+export async function fetchPlans(
+  payload: ApprovalListPayload = {},
+): Promise<IpcResult<PlanListView>> {
+  return asIpcResult<PlanListView>(BRIDGE_CONTEXT, await resolveBridge().listPlans(payload));
+}
+
+export async function fetchPlan(
+  payload: PlanIdPayload,
+): Promise<IpcResult<PlanDetailView>> {
+  return asIpcResult<PlanDetailView>(BRIDGE_CONTEXT, await resolveBridge().getPlan(payload));
+}
+
+export async function requestPlanStepById(
+  payload: PlanStepPayload,
+): Promise<IpcResult<PlanStepRequestOutcomeView>> {
+  return asIpcResult<PlanStepRequestOutcomeView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().requestPlanStep(payload),
+  );
+}
+
+export async function resolvePlanRecoveryStep(
+  payload: PlanStepPayload,
+): Promise<IpcResult<PlanRecoveryResolvedView>> {
+  return asIpcResult<PlanRecoveryResolvedView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().resolvePlanRecovery(payload),
   );
 }

@@ -51,7 +51,7 @@ function BrandMark() {
       <span>
         <span className="block font-mono text-[13px] tracking-[0.3em] text-slate-100">JARVIS</span>
         <span className="block font-mono text-[9px] uppercase tracking-[0.24em] text-slate-500">
-          Phase 6.2 · Console
+          Phase 6.3 · Plans & Approvals
         </span>
       </span>
     </div>
@@ -265,9 +265,9 @@ export function App() {
           ) : view === "chat" ? (
             <ChatView monitor={monitor} />
           ) : view === "approvals" ? (
-            <ApprovalsView health={monitor.health} />
+            <ApprovalsView monitor={monitor} />
           ) : (
-            <PlansView health={monitor.health} />
+            <PlansView monitor={monitor} />
           )}
         </main>
       </div>

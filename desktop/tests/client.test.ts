@@ -667,3 +667,503 @@ test("client error envelope stays at the documented closed set", () => {
     "UNEXPECTED",
   ]);
 });
+
+/* ------------------------------------------------------------------ */
+/* Phase 6.3: approvals + plans client contracts                       */
+/* ------------------------------------------------------------------ */
+
+import {
+  isApprovalListWire,
+  isApprovalRequestWire,
+  isApprovalSummaryWire,
+  isPlanDetailStepWire,
+  isPlanDetailWire,
+  isPlanListWire,
+  isToolResultWire,
+} from "../electron/main/api/client";
+
+const APPROVAL_ID = CONVERSATION_ID;
+
+const APPROVAL_SUMMARY_WIRE = {
+  approval_id: APPROVAL_ID,
+  tool_name: "create_directory",
+  action_description: "Create the reports directory.",
+  risk_level: "HIGH_RISK",
+  status: "PENDING",
+  created_at: "2099-01-01T00:00:00.000Z",
+  expires_at: "2099-01-01T00:05:00.000Z",
+  resolved_at: null,
+};
+
+const APPROVAL_LIST_WIRE = {
+  approvals: [APPROVAL_SUMMARY_WIRE],
+  total: 1,
+  limit: 50,
+  offset: 0,
+};
+
+const TOOL_RESULT_WIRE = {
+  tool_name: "create_directory",
+  status: "success",
+  success: true,
+  message: "Directory created.",
+  data: { path: "reports" },
+  error_code: null,
+};
+
+const PLAN_STEP_WIRES = [
+  {
+    step_id: "step_1",
+    description: "Create the reports directory.",
+    tool_name: "create_directory",
+    arguments: { path: "reports" },
+    depends_on: [],
+    status: "PENDING",
+    approval_id: null,
+    result: null,
+  },
+  {
+    step_id: "step_2",
+    description: "Write the quarterly summary file.",
+    tool_name: "write_file",
+    arguments: {},
+    depends_on: ["step_1"],
+    status: "PENDING",
+    approval_id: null,
+    result: null,
+  },
+];
+
+const PLAN_DETAIL_WIRE = {
+  plan_id: "plan-1",
+  goal: "Prepare the quarterly reports.",
+  steps: PLAN_STEP_WIRES,
+  conversation_id: CONVERSATION_ID,
+  created_at: "2099-01-01T00:00:00.000Z",
+  overall_status: "actionable",
+  ready_step_ids: ["step_1"],
+  recovery_required: [],
+  awaiting_approval: [],
+  needs_attention: false,
+};
+
+const PLAN_SUMMARY_WIRE = {
+  plan_id: "plan-1",
+  goal: "Prepare the quarterly reports.",
+  created_at: "2099-01-01T00:00:00.000Z",
+  updated_at: "2099-01-01T01:00:00.000Z",
+  step_count: 2,
+  status_counts: { PENDING: 2 },
+  recovery_required: [],
+  awaiting_approval: [],
+  needs_attention: false,
+};
+
+const PLAN_LIST_WIRE = { plans: [PLAN_SUMMARY_WIRE], total: 1, limit: 50, offset: 0 };
+
+const TASK_PLAN_RESULT_WIRE = {
+  plan_id: "plan-1",
+  goal: "Prepare the quarterly reports.",
+  steps: [
+    {
+      step_id: "step_1",
+      description: "Sync the workspace.",
+      tool_name: "sync_workspace",
+      arguments: {},
+      depends_on: [],
+      status: "FAILED",
+      approval_id: null,
+      result: null,
+    },
+  ],
+  conversation_id: CONVERSATION_ID,
+  created_at: "2099-01-01T00:00:00.000Z",
+};
+
+test("wire guards defend the approval contract boundary", () => {
+  assert.equal(isApprovalSummaryWire(APPROVAL_SUMMARY_WIRE), true);
+  assert.equal(
+    isApprovalSummaryWire({ ...APPROVAL_SUMMARY_WIRE, approval_id: "apr-1" }),
+    false,
+    "non-uuid approval ids rejected",
+  );
+  assert.equal(
+    isApprovalSummaryWire({ ...APPROVAL_SUMMARY_WIRE, risk_level: "EXTREME" }),
+    false,
+  );
+  assert.equal(
+    isApprovalSummaryWire({ ...APPROVAL_SUMMARY_WIRE, status: "STOLEN" }),
+    false,
+    "unknown lifecycle statuses are refused",
+  );
+  assert.equal(
+    isApprovalSummaryWire({ ...APPROVAL_SUMMARY_WIRE, action_description: "" }),
+    false,
+  );
+  assert.equal(isApprovalSummaryWire({ ...APPROVAL_SUMMARY_WIRE, expires_at: undefined }), false);
+
+  assert.equal(isApprovalListWire(APPROVAL_LIST_WIRE), true);
+  assert.equal(isApprovalListWire({ ...APPROVAL_LIST_WIRE, total: -1 }), false);
+  assert.equal(isApprovalListWire({ ...APPROVAL_LIST_WIRE, limit: 0 }), false);
+
+  const request = { ...APPROVAL_SUMMARY_WIRE, arguments: { path: "reports" } };
+  assert.equal(isApprovalRequestWire(request), true);
+  const smashed = { ...APPROVAL_SUMMARY_WIRE, arguments: { path: 42 } };
+  assert.equal(isApprovalRequestWire(smashed), false, "non-string arguments rejected");
+
+  assert.equal(isToolResultWire(TOOL_RESULT_WIRE), true);
+  assert.equal(isToolResultWire({ ...TOOL_RESULT_WIRE, status: "exploded" }), false);
+  assert.equal(isToolResultWire({ ...TOOL_RESULT_WIRE, success: "yes" }), false);
+  assert.equal(
+    isToolResultWire({
+      tool_name: "browse",
+      status: "success",
+      data: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [`k${i}`, "v"])),
+    }),
+    false,
+    ">32 data entries rejected",
+  );
+});
+
+test("approval list narrows the metadata page and builds the query contract", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(APPROVAL_LIST_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.listApprovals();
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.total, 1);
+    assert.deepEqual(result.data.approvals, [
+      {
+        approvalId: APPROVAL_ID,
+        toolName: "create_directory",
+        description: "Create the reports directory.",
+        riskLevel: "HIGH_RISK",
+        status: "PENDING",
+        createdAt: "2099-01-01T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:05:00.000Z",
+        resolvedAt: null,
+      },
+    ]);
+  }
+  assert.equal(calls.length, 1);
+  const { url } = calls[0];
+  assert.equal(url.pathname, "/api/approvals");
+  assert.equal(url.searchParams.get("limit"), "50");
+  assert.equal(url.searchParams.get("offset"), "0");
+});
+
+test("approval detail narrows the authoritative request with bound arguments", async () => {
+  const { calls, fetchImpl } = recordingFetch(() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({ ...APPROVAL_SUMMARY_WIRE, arguments: { path: "reports" } }),
+        { status: 200 },
+      ),
+    ),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.getApproval({ approvalId: APPROVAL_ID });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.deepEqual(result.data.arguments, { path: "reports" });
+    assert.equal(result.data.status, "PENDING");
+    assert.equal(result.data.riskLevel, "HIGH_RISK");
+  }
+  const { url } = calls[0];
+  assert.equal(url.pathname, `/api/approvals/${APPROVAL_ID}`);
+});
+
+test("approve builds the single-attempt POST contract and narrows the ToolResult", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(TOOL_RESULT_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.approveApproval({ approvalId: APPROVAL_ID });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.deepEqual(result.data, {
+      toolName: "create_directory",
+      status: "success",
+      success: true,
+      message: "Directory created.",
+      data: { path: "reports" },
+      errorCode: null,
+    });
+  }
+  assert.equal(calls.length, 1, "approve is exactly one request");
+  const { url, init } = calls[0];
+  assert.equal(url.pathname, `/api/approvals/${APPROVAL_ID}/approve`);
+  assert.equal(init.method, "POST");
+  assert.equal(init.body, undefined, "decisive POSTs carry no client-side payload");
+});
+
+test("reject returns the authoritative request in its terminal state", async () => {
+  const { calls, fetchImpl } = recordingFetch(() =>
+    Promise.resolve(
+      new Response(
+        JSON.stringify({
+          ...APPROVAL_SUMMARY_WIRE,
+          status: "REJECTED",
+          resolved_at: "2099-01-01T00:01:00.000Z",
+          arguments: {},
+        }),
+        { status: 200 },
+      ),
+    ),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.rejectApproval({ approvalId: APPROVAL_ID });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.status, "REJECTED");
+    assert.equal(result.data.resolvedAt, "2099-01-01T00:01:00.000Z");
+  }
+  assert.equal(calls.length, 1);
+  const { url, init } = calls[0];
+  assert.equal(url.pathname, `/api/approvals/${APPROVAL_ID}/reject`);
+  assert.equal(init.method, "POST");
+});
+
+test("decisive approval actions surface 409 conflicts once and never retry", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () =>
+      new Response(
+        JSON.stringify({ error: { message: "Approval is no longer pending." } }),
+        { status: 409 },
+      ),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.approveApproval({ approvalId: APPROVAL_ID });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, "HTTP_STATUS");
+    assert.equal(result.httpStatus, 409);
+    assert.equal(result.message, "Approval is no longer pending.");
+  }
+  assert.equal(calls.length, 1, "conflicts are never re-attempted");
+});
+
+test("malformed approval ids are refused before any network call", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(APPROVAL_LIST_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl);
+  for (const bad of ["", "not-a-uuid", "../../admin"]) {
+    const detail = await client.getApproval({ approvalId: bad });
+    assert.equal(detail.ok, false);
+    assert.equal(detail.ok ? null : detail.code, "UNEXPECTED");
+    const approved = await client.approveApproval({ approvalId: bad });
+    assert.equal(approved.ok ? null : approved.code, "UNEXPECTED");
+    const rejected = await client.rejectApproval({ approvalId: bad });
+    assert.equal(rejected.ok ? null : rejected.code, "UNEXPECTED");
+  }
+  assert.equal(calls.length, 0, "no request may leave the process");
+});
+
+test("every approval endpoint requires the token before any network call", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(APPROVAL_LIST_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl, null);
+  const [list, detail, approved, rejected] = await Promise.all([
+    client.listApprovals(),
+    client.getApproval({ approvalId: APPROVAL_ID }),
+    client.approveApproval({ approvalId: APPROVAL_ID }),
+    client.rejectApproval({ approvalId: APPROVAL_ID }),
+  ]);
+  for (const result of [list, detail, approved, rejected]) {
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? null : result.code, "AUTH_NOT_CONFIGURED");
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("plan list narrows summaries and builds the query contract", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(PLAN_LIST_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.listPlans({ limit: 25, offset: 5 });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.total, 1);
+    assert.deepEqual(result.data.plans, [
+      {
+        planId: "plan-1",
+        goal: "Prepare the quarterly reports.",
+        createdAt: "2099-01-01T00:00:00.000Z",
+        updatedAt: "2099-01-01T01:00:00.000Z",
+        stepCount: 2,
+        statusCounts: { PENDING: 2 },
+        recoveryRequired: [],
+        awaitingApproval: [],
+        needsAttention: false,
+      },
+    ]);
+  }
+  assert.equal(calls.length, 1);
+  const { url } = calls[0];
+  assert.equal(url.pathname, "/api/plans");
+  assert.equal(url.searchParams.get("limit"), "25");
+  assert.equal(url.searchParams.get("offset"), "5");
+});
+
+test("plan detail is carried verbatim — readiness is backend-owned", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(PLAN_DETAIL_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.getPlan({ planId: "plan-1" });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.overallStatus, "actionable");
+    assert.deepEqual(result.data.readyStepIds, ["step_1"]);
+    assert.equal(result.data.needsAttention, false);
+    assert.equal(result.data.conversationId, CONVERSATION_ID);
+    assert.equal(result.data.steps.length, 2);
+    assert.deepEqual(result.data.steps[0].arguments, { path: "reports" });
+    assert.deepEqual(result.data.steps[0].dependsOn, []);
+    assert.equal(result.data.steps[1].dependsOn[0], "step_1");
+  }
+  const { url } = calls[0];
+  assert.equal(url.pathname, "/api/plans/plan-1");
+});
+
+test("step request distinguishes executed (200) from approval-required (202) by shape", async () => {
+  const executed = makeClient(
+    recordingFetch(() => new Response(JSON.stringify(TOOL_RESULT_WIRE), { status: 200 }))
+      .fetchImpl,
+  );
+  const executedResult = await executed.requestPlanStep({ planId: "plan-1", stepId: "step_1" });
+  assert.equal(executedResult.ok, true);
+  if (executedResult.ok) {
+    assert.equal(executedResult.data.kind, "executed");
+    if (executedResult.data.kind === "executed") {
+      assert.equal(executedResult.data.execution.toolName, "create_directory");
+      assert.equal(executedResult.data.execution.success, true);
+    }
+  }
+
+  const approval = makeClient(
+    recordingFetch(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({ ...APPROVAL_SUMMARY_WIRE, arguments: { path: "reports" } }),
+          { status: 202 },
+        ),
+      ),
+    ).fetchImpl,
+  );
+  const approvalResult = await approval.requestPlanStep({ planId: "plan-1", stepId: "step_1" });
+  assert.equal(approvalResult.ok, true);
+  if (approvalResult.ok) {
+    assert.equal(approvalResult.data.kind, "approval_required");
+    if (approvalResult.data.kind === "approval_required") {
+      assert.equal(approvalResult.data.approval.riskLevel, "HIGH_RISK");
+      assert.deepEqual(approvalResult.data.approval.arguments, { path: "reports" });
+    }
+  }
+});
+
+test("resolve-recovery narrows the reconciled TaskPlan", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(TASK_PLAN_RESULT_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl);
+  const result = await client.resolvePlanRecovery({ planId: "plan-1", stepId: "step_1" });
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.data.planId, "plan-1");
+    assert.equal(result.data.conversationId, CONVERSATION_ID);
+    assert.equal(result.data.steps.length, 1);
+    assert.equal(result.data.steps[0].status, "FAILED");
+  }
+  const { url, init } = calls[0];
+  assert.equal(url.pathname, "/api/plans/plan-1/steps/step_1/resolve-recovery");
+  assert.equal(init.method, "POST");
+});
+
+test("plan methods make exactly one attempt and never retry on failure", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () =>
+      new Response(JSON.stringify({ error: { message: "Step is not ready." } }), {
+        status: 409,
+      }),
+  );
+  const client = makeClient(fetchImpl);
+  const requested = await client.requestPlanStep({ planId: "plan-1", stepId: "step_1" });
+  assert.equal(requested.ok, false);
+  const recovered = await client.resolvePlanRecovery({ planId: "plan-1", stepId: "step_1" });
+  assert.equal(recovered.ok, false);
+  assert.equal(requested.ok ? null : requested.httpStatus, 409);
+  assert.equal(calls.length, 2, "exactly one call each — no retries");
+});
+
+test("malformed plan/step identifiers are refused before any network call", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(PLAN_LIST_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl);
+  for (const bad of ["", "../../plan", "plan;--drop", "x".repeat(65)]) {
+    const detail = await client.getPlan({ planId: bad });
+    assert.equal(detail.ok, false);
+    assert.equal(detail.ok ? null : detail.code, "UNEXPECTED");
+  }
+  for (const badStep of ["", "step-1", "step.1", "x".repeat(33)]) {
+    const request = await client.requestPlanStep({ planId: "plan-1", stepId: badStep });
+    assert.equal(request.ok ? null : request.code, "UNEXPECTED");
+    const recovery = await client.resolvePlanRecovery({ planId: "plan-1", stepId: badStep });
+    assert.equal(recovery.ok ? null : recovery.code, "UNEXPECTED");
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("every plan endpoint requires the token before any network call", async () => {
+  const { calls, fetchImpl } = recordingFetch(
+    () => new Response(JSON.stringify(PLAN_LIST_WIRE), { status: 200 }),
+  );
+  const client = makeClient(fetchImpl, null);
+  const [list, detail, requested, recovered] = await Promise.all([
+    client.listPlans(),
+    client.getPlan({ planId: "plan-1" }),
+    client.requestPlanStep({ planId: "plan-1", stepId: "step_1" }),
+    client.resolvePlanRecovery({ planId: "plan-1", stepId: "step_1" }),
+  ]);
+  for (const result of [list, detail, requested, recovered]) {
+    assert.equal(result.ok, false);
+    assert.equal(result.ok ? null : result.code, "AUTH_NOT_CONFIGURED");
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("wire guards defend the plan contract boundary", () => {
+  assert.equal(isPlanDetailStepWire(PLAN_STEP_WIRES[0]), true);
+  assert.equal(
+    isPlanDetailStepWire({ ...PLAN_STEP_WIRES[0], step_id: "step;1" }),
+    false,
+    "step identifiers are pattern-checked",
+  );
+  assert.equal(isPlanDetailStepWire({ ...PLAN_STEP_WIRES[0], description: "" }), false);
+
+  assert.equal(isPlanDetailWire(PLAN_DETAIL_WIRE), true);
+  assert.equal(
+    isPlanDetailWire({ ...PLAN_DETAIL_WIRE, overall_status: "maybe" }),
+    false,
+    "derived overall_status must be from the documented enum",
+  );
+  assert.equal(isPlanDetailWire({ ...PLAN_DETAIL_WIRE, steps: [] }), false);
+  assert.equal(isPlanDetailWire({ ...PLAN_DETAIL_WIRE, needs_attention: "no" }), false);
+  assert.equal(
+    isPlanDetailWire({ ...PLAN_DETAIL_WIRE, ready_step_ids: [1, 2] }),
+    false,
+  );
+
+  assert.equal(isPlanListWire(PLAN_LIST_WIRE), true);
+  assert.equal(isPlanListWire({ ...PLAN_LIST_WIRE, limit: 0 }), false);
+  assert.equal(
+    isPlanListWire({ ...PLAN_LIST_WIRE, plans: [{ ...PLAN_SUMMARY_WIRE, goal: null }] }),
+    false,
+  );
+});

@@ -29,6 +29,14 @@ export const IPC_CHANNELS = {
   listConversations: "jarvis:list-conversations",
   getConversation: "jarvis:get-conversation",
   deleteConversation: "jarvis:delete-conversation",
+  listApprovals: "jarvis:list-approvals",
+  getApproval: "jarvis:get-approval",
+  approveApproval: "jarvis:approve-approval",
+  rejectApproval: "jarvis:reject-approval",
+  listPlans: "jarvis:list-plans",
+  getPlan: "jarvis:get-plan",
+  requestPlanStep: "jarvis:request-plan-step",
+  resolvePlanRecovery: "jarvis:resolve-plan-recovery",
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
@@ -89,6 +97,34 @@ export type ConversationIdPayload = {
   conversationId: string;
 };
 
+/** Payload type shared by every backend metadata listing (approvals, plans). */
+export interface BoundedPagePayload {
+  limit?: number;
+  offset?: number;
+}
+
+/** `jarvis:list-approvals` payload (same backend page bounds 1..200). */
+export type ApprovalListPayload = BoundedPagePayload;
+
+/** `jarvis:list-plans` payload (same backend page bounds 1..200). */
+export type PlanListPayload = BoundedPagePayload;
+
+/** `jarvis:get-approval`, `jarvis:approve-approval`, `jarvis:reject-approval`. */
+export type ApprovalIdPayload = {
+  approvalId: string;
+};
+
+/** `jarvis:get-plan` payload. */
+export type PlanIdPayload = {
+  planId: string;
+};
+
+/** `jarvis:request-plan-step` / `jarvis:resolve-plan-recovery` payload. */
+export type PlanStepPayload = {
+  planId: string;
+  stepId: string;
+};
+
 /* ------------------------- validation contract --------------------- */
 
 /** Backend-bound message size: mirrors ChatRequest.message.maxLength. */
@@ -101,8 +137,18 @@ export const CHAT_MESSAGE_MAX_LENGTH = 4000;
 export const CONVERSATION_ID_PATTERN =
   /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
-/** Backend policy: page size 1..200 (DEFAULT_LIST_LIMIT 50, MAX 200). */
+/** Backend policy: page size 1..200 (DEFAULT_LIST_LIMIT 50, MAX 200) —
+ *  identical bounds in every backend metadata listing endpoint. */
 export const CONVERSATION_LIST_LIMITS = { default: 50, min: 1, max: 200 } as const;
+
+/** Approval identifiers are also `str(uuid4())` (backend/app/services/approval_store.py). */
+export const APPROVAL_ID_PATTERN = CONVERSATION_ID_PATTERN;
+
+/** Backend PlanDetail.plan_id pattern (`^[a-zA-Z0-9_-]{1,64}$`). */
+export const PLAN_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
+
+/** Backend PlanStep.step_id pattern (`^[a-zA-Z0-9_]{1,32}$`). */
+export const PLAN_STEP_ID_PATTERN = /^[a-zA-Z0-9_]{1,32}$/;
 
 export type PayloadValidation<IpcPayloadT> =
   | { ok: true; value: IpcPayloadT }
@@ -154,20 +200,24 @@ export function validateChatSendPayload(
   return { ok: true, value: { message, conversationId } };
 }
 
-/** Validate `jarvis:list-conversations` (optional bounded pagination). */
-export function validateConversationListPayload(
+/** Shared page validator for every backend metadata listing (1..200). */
+function validateBoundedPage(
   value: unknown,
-): PayloadValidation<ConversationListPayload> {
+): PayloadValidation<{ limit?: number; offset?: number }> {
   if (value === undefined || isEmptyPayload(value)) return { ok: true, value: {} };
   if (!isPlainObject(value)) {
-    return { ok: false, reason: "Conversation list payload must be an object." };
+    return { ok: false, reason: "Listing payload must be an object." };
   }
   const { limit, offset, ...extra } = value;
   if (Object.keys(extra).length > 0) {
-    return { ok: false, reason: "Conversation list payload accepts limit and offset only." };
+    return { ok: false, reason: "Listing payload accepts limit and offset only." };
   }
   if (limit !== undefined) {
-    if (!isInteger(limit) || limit < CONVERSATION_LIST_LIMITS.min || limit > CONVERSATION_LIST_LIMITS.max) {
+    if (
+      !isInteger(limit) ||
+      limit < CONVERSATION_LIST_LIMITS.min ||
+      limit > CONVERSATION_LIST_LIMITS.max
+    ) {
       return {
         ok: false,
         reason: `limit must be an integer between ${CONVERSATION_LIST_LIMITS.min} and ${CONVERSATION_LIST_LIMITS.max}.`,
@@ -180,6 +230,27 @@ export function validateConversationListPayload(
     }
   }
   return { ok: true, value: { limit, offset } };
+}
+
+/** Validate `jarvis:list-conversations` (optional bounded pagination). */
+export function validateConversationListPayload(
+  value: unknown,
+): PayloadValidation<ConversationListPayload> {
+  return validateBoundedPage(value);
+}
+
+/** Validate `jarvis:list-approvals` (same backend page bounds). */
+export function validateApprovalListPayload(
+  value: unknown,
+): PayloadValidation<ApprovalListPayload> {
+  return validateBoundedPage(value);
+}
+
+/** Validate `jarvis:list-plans` (same backend page bounds). */
+export function validatePlanListPayload(
+  value: unknown,
+): PayloadValidation<PlanListPayload> {
+  return validateBoundedPage(value);
 }
 
 /** Validate `jarvis:get-conversation` / `jarvis:delete-conversation`. */
@@ -200,6 +271,64 @@ export function validateConversationIdPayload(
   return { ok: true, value: { conversationId } };
 }
 
+/** Validate `jarvis:get-approval` / `jarvis:approve-approval` / `jarvis:reject-approval`. */
+export function validateApprovalIdPayload(
+  value: unknown,
+): PayloadValidation<ApprovalIdPayload> {
+  if (!isPlainObject(value)) {
+    return { ok: false, reason: "Approval payload must be an object." };
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== "approvalId") {
+    return { ok: false, reason: "Approval payload accepts exactly approvalId." };
+  }
+  const approvalId = value["approvalId"];
+  if (typeof approvalId !== "string" || !APPROVAL_ID_PATTERN.test(approvalId)) {
+    return { ok: false, reason: "approvalId must be a backend approval uuid." };
+  }
+  return { ok: true, value: { approvalId } };
+}
+
+/** Validate `jarvis:get-plan`. */
+export function validatePlanIdPayload(
+  value: unknown,
+): PayloadValidation<PlanIdPayload> {
+  if (!isPlainObject(value)) {
+    return { ok: false, reason: "Plan payload must be an object." };
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== "planId") {
+    return { ok: false, reason: "Plan payload accepts exactly planId." };
+  }
+  const planId = value["planId"];
+  if (typeof planId !== "string" || !PLAN_ID_PATTERN.test(planId)) {
+    return { ok: false, reason: "planId must match the backend plan identifier pattern." };
+  }
+  return { ok: true, value: { planId } };
+}
+
+/** Validate `jarvis:request-plan-step` / `jarvis:resolve-plan-recovery`. */
+export function validatePlanStepPayload(
+  value: unknown,
+): PayloadValidation<PlanStepPayload> {
+  if (!isPlainObject(value)) {
+    return { ok: false, reason: "Plan step payload must be an object." };
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== "planId" || keys[1] !== "stepId") {
+    return { ok: false, reason: "Plan step payload accepts exactly planId and stepId." };
+  }
+  const planId = value["planId"];
+  if (typeof planId !== "string" || !PLAN_ID_PATTERN.test(planId)) {
+    return { ok: false, reason: "planId must match the backend plan identifier pattern." };
+  }
+  const stepId = value["stepId"];
+  if (typeof stepId !== "string" || !PLAN_STEP_ID_PATTERN.test(stepId)) {
+    return { ok: false, reason: "stepId must match the backend step identifier pattern." };
+  }
+  return { ok: true, value: { planId, stepId } };
+}
+
 /** Per-channel payload validators; the registry consumes this table. */
 export type IpcPayloadMap = {
   "jarvis:backend-status": EmptyPayload;
@@ -209,6 +338,14 @@ export type IpcPayloadMap = {
   "jarvis:list-conversations": ConversationListPayload;
   "jarvis:get-conversation": ConversationIdPayload;
   "jarvis:delete-conversation": ConversationIdPayload;
+  "jarvis:list-approvals": ApprovalListPayload;
+  "jarvis:get-approval": ApprovalIdPayload;
+  "jarvis:approve-approval": ApprovalIdPayload;
+  "jarvis:reject-approval": ApprovalIdPayload;
+  "jarvis:list-plans": PlanListPayload;
+  "jarvis:get-plan": PlanIdPayload;
+  "jarvis:request-plan-step": PlanStepPayload;
+  "jarvis:resolve-plan-recovery": PlanStepPayload;
 };
 
 export type PayloadValidator<K extends keyof IpcPayloadMap> = (
@@ -231,6 +368,14 @@ export const PAYLOAD_VALIDATORS: {
   "jarvis:list-conversations": validateConversationListPayload,
   "jarvis:get-conversation": validateConversationIdPayload,
   "jarvis:delete-conversation": validateConversationIdPayload,
+  "jarvis:list-approvals": validateApprovalListPayload,
+  "jarvis:get-approval": validateApprovalIdPayload,
+  "jarvis:approve-approval": validateApprovalIdPayload,
+  "jarvis:reject-approval": validateApprovalIdPayload,
+  "jarvis:list-plans": validatePlanListPayload,
+  "jarvis:get-plan": validatePlanIdPayload,
+  "jarvis:request-plan-step": validatePlanStepPayload,
+  "jarvis:resolve-plan-recovery": validatePlanStepPayload,
 };
 
 /* ------------------------------------------------------------------ */
@@ -387,6 +532,123 @@ export type ConversationDeletedView = {
 };
 
 /* ------------------------------------------------------------------ */
+/* Approvals (backend/app/schemas/approval.py + tool.py ToolResult)     */
+/* ------------------------------------------------------------------ */
+
+/** Full ToolResult projection for the workspace (extends the chat-side ExecutedActionView). */
+export type ToolExecutionView = {
+  toolName: string;
+  status: "success" | "already_exists" | "failure";
+  success: boolean;
+  message: string;
+  /** Bounded string map (≤32 items) exactly as the backend returned it. */
+  data: Record<string, string> | null;
+  /** Stable, non-sensitive error classification or null. */
+  errorCode: string | null;
+};
+
+/** GET /api/approvals row (metadata only — never includes arguments). */
+export type ApprovalSummaryView = {
+  approvalId: string;
+  toolName: string;
+  description: string;
+  riskLevel: RiskLevelView;
+  status: ApprovalStatusView;
+  createdAt: string;
+  expiresAt: string;
+  resolvedAt: string | null;
+};
+
+/** GET /api/approvals/{id} — authoritative read including exact arguments. */
+export type ApprovalRequestView = ApprovalSummaryView & {
+  /** Exact validated arguments this approval is bound to (≤32 string entries). */
+  arguments: Record<string, string>;
+};
+
+/** GET /api/approvals for the UI. */
+export type ApprovalListView = {
+  approvals: ApprovalSummaryView[];
+  total: number;
+};
+
+/* ------------------------------------------------------------------ */
+/* Plans (backend/app/schemas/plan.py)                                  */
+/* ------------------------------------------------------------------ */
+
+export type PlanOverallStatusView =
+  | "recovery_required"
+  | "awaiting_approval"
+  | "actionable"
+  | "failed"
+  | "in_progress"
+  | "completed";
+
+/** GET /api/plans row — metadata with attention flags (Phase 5.2-a). */
+export type PlanSummaryView = {
+  planId: string;
+  goal: string;
+  createdAt: string;
+  updatedAt: string;
+  stepCount: number;
+  /** Recorded step count per status key (bounded by the 8-step ceiling). */
+  statusCounts: Record<string, number>;
+  recoveryRequired: string[];
+  awaitingApproval: string[];
+  /** Backend derivation: true while any step is RECOVERY_REQUIRED or AWAITING_APPROVAL. */
+  needsAttention: boolean;
+};
+
+/** One authored plan step inside the authoritative PlanDetail. */
+export type PlanDetailStepView = {
+  stepId: string;
+  description: string;
+  toolName: string;
+  arguments: Record<string, string>;
+  dependsOn: string[];
+  status: PlanStepStatusView;
+  /** The exact single-use approval bound to this step, if one was created. */
+  approvalId: string | null;
+  /** Recorded execution result, once the step ran (or FAILED resolved). */
+  result: ToolExecutionView | null;
+};
+
+/** GET /api/plans/{id} — authoritative read with backend-derived status. */
+export type PlanDetailView = {
+  planId: string;
+  goal: string;
+  conversationId: string | null;
+  createdAt: string;
+  overallStatus: PlanOverallStatusView;
+  steps: PlanDetailStepView[];
+  /** Backend derivation — PENDING steps whose dependencies have recorded results. */
+  readyStepIds: string[];
+  recoveryRequired: string[];
+  awaitingApproval: string[];
+  needsAttention: boolean;
+};
+
+/** GET /api/plans for the UI. */
+export type PlanListView = {
+  plans: PlanSummaryView[];
+  total: number;
+};
+
+/** POST .../steps/{step}/request outcome, discriminated exactly like the API (200|202). */
+export type PlanStepRequestOutcomeView =
+  | { kind: "executed"; execution: ToolExecutionView }
+  /** 202: a mutating step created a pending single-use approval. Nothing ran. */
+  | { kind: "approval_required"; approval: ApprovalRequestView };
+
+/** POST .../steps/{step}/resolve-recovery — fresh TaskPlan after reconciliation. */
+export type PlanRecoveryResolvedView = {
+  planId: string;
+  goal: string;
+  conversationId: string | null;
+  createdAt: string;
+  steps: PlanDetailStepView[];
+};
+
+/* ------------------------------------------------------------------ */
 /* Preload bridge surface (the ONLY API the renderer can reach)         */
 /* ------------------------------------------------------------------ */
 
@@ -404,6 +666,14 @@ export const PRELOAD_METHODS = [
   { method: "listConversations", channel: IPC_CHANNELS.listConversations },
   { method: "getConversation", channel: IPC_CHANNELS.getConversation },
   { method: "deleteConversation", channel: IPC_CHANNELS.deleteConversation },
+  { method: "listApprovals", channel: IPC_CHANNELS.listApprovals },
+  { method: "getApproval", channel: IPC_CHANNELS.getApproval },
+  { method: "approveApproval", channel: IPC_CHANNELS.approveApproval },
+  { method: "rejectApproval", channel: IPC_CHANNELS.rejectApproval },
+  { method: "listPlans", channel: IPC_CHANNELS.listPlans },
+  { method: "getPlan", channel: IPC_CHANNELS.getPlan },
+  { method: "requestPlanStep", channel: IPC_CHANNELS.requestPlanStep },
+  { method: "resolvePlanRecovery", channel: IPC_CHANNELS.resolvePlanRecovery },
 ] as const;
 
 export type PreloadMethodName = (typeof PRELOAD_METHODS)[number]["method"];
@@ -417,6 +687,14 @@ export type JarvisApi = {
   listConversations(payload?: ConversationListPayload): Promise<IpcResult<ConversationListView>>;
   getConversation(payload: ConversationIdPayload): Promise<IpcResult<ConversationHistoryView>>;
   deleteConversation(payload: ConversationIdPayload): Promise<IpcResult<ConversationDeletedView>>;
+  listApprovals(payload?: ApprovalListPayload): Promise<IpcResult<ApprovalListView>>;
+  getApproval(payload: ApprovalIdPayload): Promise<IpcResult<ApprovalRequestView>>;
+  approveApproval(payload: ApprovalIdPayload): Promise<IpcResult<ToolExecutionView>>;
+  rejectApproval(payload: ApprovalIdPayload): Promise<IpcResult<ApprovalRequestView>>;
+  listPlans(payload?: PlanListPayload): Promise<IpcResult<PlanListView>>;
+  getPlan(payload: PlanIdPayload): Promise<IpcResult<PlanDetailView>>;
+  requestPlanStep(payload: PlanStepPayload): Promise<IpcResult<PlanStepRequestOutcomeView>>;
+  resolvePlanRecovery(payload: PlanStepPayload): Promise<IpcResult<PlanRecoveryResolvedView>>;
 };
 
 /** Human-readable copy for error codes (renderer-side). */
@@ -439,17 +717,33 @@ export const CHAT_ERROR_CONSEQUENCES: Partial<Record<IpcErrorCode, string>> = {
   UNEXPECTED: "Your message may not have been sent — it is restored in the composer.",
 };
 
+/** Workspace-specific consequence copy (same failure-UI pattern as chat). */
+export const APPROVAL_ERROR_CONSEQUENCES: Partial<Record<IpcErrorCode, string>> = {
+  AUTH_NOT_CONFIGURED: "Your decision was not sent — the approval stays in its current state.",
+  BACKEND_UNREACHABLE: "Your decision was not sent — the approval stays in its current state.",
+  TIMEOUT: "Your decision was not sent — the approval stays in its current state.",
+  UNEXPECTED: "Your decision may not have been sent — the approval stays in its current state.",
+};
+
+export const PLAN_ERROR_CONSEQUENCES: Partial<Record<IpcErrorCode, string>> = {
+  AUTH_NOT_CONFIGURED: "Your request was not sent — the plan is unchanged.",
+  BACKEND_UNREACHABLE: "Your request was not sent — the plan is unchanged.",
+  TIMEOUT: "Your request was not sent — the plan is unchanged.",
+  UNEXPECTED: "Your request may not have been sent — the plan is unchanged.",
+};
+
 /**
- * Understanding-oriented copy for HTTP statuses the chat can surface
- * (beyond IPC_ERROR_COPY). Backend policy text arrives as the structured
+ * Understanding-oriented copy for HTTP statuses the workspaces can surface
+ * (extends the chat context). Backend policy text arrives as the structured
  * `error.message`; this adds what the status MEANS.
  */
 export const HTTP_STATUS_HINTS: Record<number, string> = {
   403: "denied by backend policy — nothing was executed.",
-  404: "not found — it may have been deleted in the meantime.",
-  422: "rejected by validation — adjust the message and resend.",
+  404: "not found — it may have been resolved or deleted since you loaded it.",
+  409: "conflict — the state changed since you loaded it; nothing happened, refresh and check.",
+  422: "rejected by validation — the request was not actionable.",
   500: "internal backend error — nothing was executed.",
   502: "the language model provider failed — nothing was executed.",
   503: "the backend is at capacity or not fully configured — try again shortly.",
-  504: "the language model timed out — nothing was executed.",
+  504: "the request timed out server-side — treat the outcome as uncertain.",
 };

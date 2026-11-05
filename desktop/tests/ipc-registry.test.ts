@@ -1,4 +1,4 @@
-/** IPC registry + preload bridge contract tests (7 channels, per-channel payloads). */
+/** IPC registry + preload bridge contract tests (15 channels, per-channel payloads). */
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -23,6 +23,15 @@ const HANDLERS: IpcHandlers = {
   "jarvis:get-conversation": async (payload) => ipcOk({ channel: "get-conversation", payload }),
   "jarvis:delete-conversation": async (payload) =>
     ipcOk({ channel: "delete-conversation", payload }),
+  "jarvis:list-approvals": async (payload) => ipcOk({ channel: "list-approvals", payload }),
+  "jarvis:get-approval": async (payload) => ipcOk({ channel: "get-approval", payload }),
+  "jarvis:approve-approval": async (payload) => ipcOk({ channel: "approve-approval", payload }),
+  "jarvis:reject-approval": async (payload) => ipcOk({ channel: "reject-approval", payload }),
+  "jarvis:list-plans": async (payload) => ipcOk({ channel: "list-plans", payload }),
+  "jarvis:get-plan": async (payload) => ipcOk({ channel: "get-plan", payload }),
+  "jarvis:request-plan-step": async (payload) => ipcOk({ channel: "request-plan-step", payload }),
+  "jarvis:resolve-plan-recovery": async (payload) =>
+    ipcOk({ channel: "resolve-plan-recovery", payload }),
 };
 
 const VALID_UUID = "123e4567-e89b-12d3-a456-426614174000";
@@ -33,11 +42,11 @@ function dispatch(channel: IpcChannel, payload: unknown, url = "http://127.0.0.1
   return createIpcRegistry(HANDLERS, trusted).dispatch(channel, payload, url);
 }
 
-test("preload bridge covers every registered channel exactly (7 channels)", () => {
+test("preload bridge covers every registered channel exactly (15 channels)", () => {
   const channels = PRELOAD_METHODS.map((m) => m.channel);
   const registered = Object.values(IPC_CHANNELS);
   assert.equal(channels.length, registered.length);
-  assert.equal(channels.length, 7);
+  assert.equal(channels.length, 15);
   assert.deepEqual([...channels].sort(), [...registered].sort());
   for (const method of PRELOAD_METHODS) {
     assert.match(method.channel, /^jarvis:/);
@@ -50,7 +59,7 @@ test("every channel has a payload validator in the shared table", () => {
     const validator = PAYLOAD_VALIDATORS[channel as keyof IpcPayloadMap];
     assert.equal(typeof validator, "function", `missing validator for ${channel}`);
   }
-  assert.equal(Object.keys(PAYLOAD_VALIDATORS).length, 7);
+  assert.equal(Object.keys(PAYLOAD_VALIDATORS).length, 15);
 });
 
 test("dispatch passes the handler envelope through without re-wrapping", async () => {
@@ -216,5 +225,102 @@ test("handler crashes collapse to bounded UNEXPECTED failures", async () => {
       "handler internals must not reach the renderer",
     );
     assert.match(result.message, /unexpected failure/u, "fixed, non-sensitive text only");
+  }
+});
+
+/* -------------------------------------------------------------------- */
+/* Phase 6.3 workspace channels                                          */
+/* -------------------------------------------------------------------- */
+
+test("approval channel payloads require a strict backend uuid", async () => {
+  for (const channel of [
+    "jarvis:list-approvals",
+    "jarvis:get-approval",
+    "jarvis:approve-approval",
+    "jarvis:reject-approval",
+  ] as const) {
+    const listing = channel === "jarvis:list-approvals";
+    // The listing page accepts bounded pages; the id channels want uuids.
+    const ok = await dispatch(channel, listing ? {} : { approvalId: VALID_UUID });
+    assert.equal(ok.ok, true, channel);
+  }
+
+  for (const channel of [
+    "jarvis:get-approval",
+    "jarvis:approve-approval",
+    "jarvis:reject-approval",
+  ] as const) {
+    for (const bad of ["", VALID_UUID.slice(1), `X${VALID_UUID}`, null, 42]) {
+      const result = (await dispatch(channel, { approvalId: bad })) as IpcResult<never>;
+      assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `${channel} ${String(bad)}`);
+    }
+    // Exactly one key allowed — no argument smuggling on decision actions.
+    const smuggled = (await dispatch(channel, {
+      approvalId: VALID_UUID,
+      arguments: { cmd: "rm -rf /" },
+    })) as IpcResult<never>;
+    assert.equal(smuggled.ok ? null : smuggled.code, "BAD_PAYLOAD");
+    const missing = (await dispatch(channel, {})) as IpcResult<never>;
+    assert.equal(missing.ok ? null : missing.code, "BAD_PAYLOAD");
+  }
+});
+
+test("plan id and step id payloads enforce backend identifier patterns", async () => {
+  const ok = (await dispatch("jarvis:get-plan", { planId: "travel-plan_01" })) as IpcResult<{
+    payload: { planId: string };
+  }>;
+  assert.equal(ok.ok, true);
+  if (ok.ok) assert.equal(ok.data.payload.planId, "travel-plan_01");
+
+  for (const bad of ["", "travel plan", "plan;drop", `${"a".repeat(65)}`, null, 42]) {
+    const result = (await dispatch("jarvis:get-plan", { planId: bad })) as IpcResult<never>;
+    assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `planId ${String(bad)}`);
+  }
+
+  for (const channel of ["jarvis:request-plan-step", "jarvis:resolve-plan-recovery"] as const) {
+    const ok = (await dispatch(channel, {
+      planId: "clean-house",
+      stepId: "step_1",
+    })) as IpcResult<{ payload: { planId: string; stepId: string } }>;
+    assert.equal(ok.ok, true, channel);
+    if (ok.ok) {
+      assert.equal(ok.data.payload.planId, "clean-house");
+      assert.equal(ok.data.payload.stepId, "step_1");
+    }
+
+    for (const badStep of ["", "s-1", "step.1", `${"a".repeat(33)}`, null, 42]) {
+      const result = (await dispatch(channel, {
+        planId: "clean-house",
+        stepId: badStep,
+      })) as IpcResult<never>;
+      assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `${channel} ${String(badStep)}`);
+    }
+    const partial = (await dispatch(channel, { planId: "clean-house" })) as IpcResult<never>;
+    assert.equal(partial.ok ? null : partial.code, "BAD_PAYLOAD");
+    const extra = (await dispatch(channel, {
+      planId: "clean-house",
+      stepId: "step_1",
+      force: true,
+    })) as IpcResult<never>;
+    assert.equal(extra.ok ? null : extra.code, "BAD_PAYLOAD");
+  }
+});
+
+test("the workspace listing channels share the conversation page bounds", async () => {
+  for (const channel of ["jarvis:list-approvals", "jarvis:list-plans"] as const) {
+    const empty = await dispatch(channel, {});
+    assert.equal(empty.ok, true, channel);
+    const undefinedPayload = await dispatch(channel, undefined);
+    assert.equal(undefinedPayload.ok, true);
+    const bounded = await dispatch(channel, { limit: 200, offset: 1 });
+    assert.equal(bounded.ok, true, `${channel} accepts the 1..200 window`);
+    for (const badLimit of [0, 201, 12.5, "50"]) {
+      const result = (await dispatch(channel, { limit: badLimit })) as IpcResult<never>;
+      assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `${channel} ${String(badLimit)}`);
+    }
+    const extra = (await dispatch(channel, { limit: 50, approvalId: VALID_UUID })) as IpcResult<
+      never
+    >;
+    assert.equal(extra.ok ? null : extra.code, "BAD_PAYLOAD");
   }
 });

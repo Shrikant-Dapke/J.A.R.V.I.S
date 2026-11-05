@@ -23,8 +23,13 @@ import {
   CHAT_MESSAGE_MAX_LENGTH,
   CONVERSATION_ID_PATTERN,
   CONVERSATION_LIST_LIMITS,
+  PLAN_ID_PATTERN,
+  PLAN_STEP_ID_PATTERN,
   ipcError,
   ipcOk,
+  type ApprovalListView,
+  type ApprovalRequestView,
+  type ApprovalSummaryView,
   type ChatExchange,
   type ChatExchangeStatus,
   type ConversationDeletedView,
@@ -37,13 +42,21 @@ import {
   type HealthSnapshot,
   type IpcErrorCode,
   type IpcResult,
+  type PlanListView,
+  type PlanDetailView,
+  type PlanDetailStepView,
+  type PlanOverallStatusView,
   type PlanProposalView,
+  type PlanRecoveryResolvedView,
+  type PlanStepRequestOutcomeView,
   type PlanStepStatusView,
   type PlanStepView,
+  type PlanSummaryView,
   type ProposedActionView,
   type RiskLevelView,
   type ApprovalStatusView,
   type SystemInfoSummary,
+  type ToolExecutionView,
 } from "../../../shared/ipc-contract";
 import { isLoopbackHttpUrl } from "../net";
 
@@ -74,6 +87,19 @@ export const DEFAULT_CHAT_TIMEOUT_MS = 615_000;
 export const DEFAULT_CONVERSATIONS_TIMEOUT_MS = 10_000;
 export const DEFAULT_HISTORY_TIMEOUT_MS = 15_000;
 export const DEFAULT_DELETE_TIMEOUT_MS = 10_000;
+
+/**
+ * Approvals/plans: listings and reads are cheap loops; decisive actions
+ * execute one registered tool under the backend's tool budget
+ * (TOOL_TIMEOUT_SECONDS ≤ 120 by config bounds) and never retry, so the
+ * desktop deadline sits ABOVE that worst case.
+ */
+export const APPROVALS_TIMEOUT_MS = 10_000;
+export const APPROVAL_ACTION_TIMEOUT_MS = 150_000;
+export const PLANS_TIMEOUT_MS = 10_000;
+export const PLAN_DETAIL_TIMEOUT_MS = 15_000;
+export const PLAN_STEP_REQUEST_TIMEOUT_MS = 150_000;
+export const PLAN_RECOVERY_TIMEOUT_MS = 15_000;
 
 /** Backend pagination/history ceilings (app/api/conversations.py). */
 const MAX_HISTORY_TURNS = 400;
@@ -441,6 +467,325 @@ export function isConversationClearWire(value: unknown): value is ConversationCl
 }
 
 /* ------------------------------------------------------------------ */
+/* Approvals wire shapes (backend/app/schemas/approval.py + tool.py)    */
+/* ------------------------------------------------------------------ */
+
+export const APPROVAL_ID_MAX_LENGTH = 64;
+
+type ApprovalSummaryWire = {
+  approval_id: string;
+  tool_name: string;
+  action_description: string;
+  risk_level: string;
+  status?: string;
+  created_at?: string;
+  expires_at: string;
+  resolved_at?: string | null;
+};
+
+type ApprovalListWire = {
+  approvals: ApprovalSummaryWire[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+const MAX_ARGUMENT_TEXT_LENGTH = 512;
+
+/** Bounded `Record<string, string>` map (backend MAX_PAYLOAD_ITEMS = 32). */
+function isBoundedStringMap(
+  args: unknown,
+  maxItems: number,
+  maxKeyLength: number,
+): args is Record<string, string> {
+  if (!isRecord(args)) return false;
+  const entries = Object.entries(args);
+  if (entries.length > maxItems) return false;
+  return entries.every(
+    ([key, value]) =>
+      typeof key === "string" &&
+      key.length > 0 &&
+      key.length <= maxKeyLength &&
+      typeof value === "string" &&
+      value.length <= MAX_ARGUMENT_TEXT_LENGTH,
+  );
+}
+
+function isBoundedIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 64;
+}
+
+function isBoundedId(value: unknown, max: number, pattern: RegExp): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= max &&
+    pattern.test(value)
+  );
+}
+
+export function isApprovalSummaryWire(value: unknown): value is ApprovalSummaryWire {
+  if (
+    !isRecord(value) ||
+    typeof value["approval_id"] !== "string" ||
+    value["approval_id"].length === 0 ||
+    value["approval_id"].length > APPROVAL_ID_MAX_LENGTH ||
+    !CONVERSATION_ID_PATTERN.test(value["approval_id"]) ||
+    !isBoundedString(value["tool_name"], 64) ||
+    typeof value["action_description"] !== "string" ||
+    value["action_description"].length === 0 ||
+    value["action_description"].length > 512 ||
+    typeof value["risk_level"] !== "string" ||
+    !RISK_LEVELS.has(value["risk_level"])
+  ) {
+    return false;
+  }
+  const status = value["status"];
+  if (status !== undefined && !(typeof status === "string" && APPROVAL_STATUSES.has(status))) {
+    return false;
+  }
+  if (!isBoundedIsoTimestamp(value["expires_at"])) return false;
+  const createdAt = value["created_at"];
+  if (createdAt !== undefined && !isBoundedIsoTimestamp(createdAt)) return false;
+  const resolvedAt = value["resolved_at"];
+  if (resolvedAt !== undefined && resolvedAt !== null && !isBoundedIsoTimestamp(resolvedAt)) {
+    return false;
+  }
+  return true;
+}
+
+export function isApprovalListWire(value: unknown): value is ApprovalListWire {
+  if (!isRecord(value) || !isBoundedInt(value["total"], 0, Number.MAX_SAFE_INTEGER)) return false;
+  const approvals = value["approvals"];
+  if (!Array.isArray(approvals) || approvals.length > MAX_LIST_CONVERSATIONS) return false;
+  if (!approvals.every((item) => isApprovalSummaryWire(item))) return false;
+  return (
+    isBoundedInt(value["limit"], 1, Number.MAX_SAFE_INTEGER) &&
+    isBoundedInt(value["offset"], 0, Number.MAX_SAFE_INTEGER)
+  );
+}
+
+type ApprovalRequestWire = ApprovalSummaryWire & {
+  arguments?: Record<string, string> | null;
+};
+
+export function isApprovalRequestWire(value: unknown): value is ApprovalRequestWire {
+  if (!isApprovalSummaryWire(value)) return false;
+  const args = (value as { arguments?: unknown })["arguments"];
+  if (args === undefined || args === null) return true;
+  return isBoundedStringMap(args, MAX_ACTION_ARGUMENTS, 128);
+}
+
+/** Full ToolResult guard (backend/app/schemas/tool.py required: tool_name, status). */
+type ToolResultWire = {
+  tool_name: string;
+  status: "success" | "already_exists" | "failure";
+  success?: boolean;
+  message?: string;
+  data?: Record<string, string> | null;
+  error_code?: string | null;
+};
+
+export function isToolResultWire(value: unknown): value is ToolResultWire {
+  if (!isRecord(value)) return false;
+  const toolName = value["tool_name"];
+  const status = value["status"];
+  if (!isBoundedString(toolName, 64) || typeof status !== "string") return false;
+  if (!TOOL_RESULT_STATUSES.has(status)) return false;
+  const success = value["success"];
+  if (success !== undefined && typeof success !== "boolean") return false;
+  const message = value["message"];
+  if (message !== undefined && (typeof message !== "string" || message.length > 512)) return false;
+  const data = value["data"];
+  if (data !== undefined && data !== null && !isBoundedStringMap(data, MAX_ACTION_ARGUMENTS, 128)) {
+    return false;
+  }
+  const errorCode = value["error_code"];
+  return errorCode === undefined || errorCode === null || isBoundedString(errorCode, 64);
+}
+
+/* ------------------------------------------------------------------ */
+/* Plans wire shapes (backend/app/schemas/plan.py)                      */
+/* ------------------------------------------------------------------ */
+
+const PLAN_OVERALL_STATUSES: ReadonlySet<string> = new Set([
+  "recovery_required",
+  "awaiting_approval",
+  "actionable",
+  "failed",
+  "in_progress",
+  "completed",
+]);
+
+type PlanDetailStepWire = {
+  step_id: string;
+  description: string;
+  tool_name: string;
+  arguments?: Record<string, string>;
+  depends_on?: string[];
+  status?: string;
+  approval_id?: string | null;
+  result?: ToolResultWire | null;
+};
+
+type PlanDetailWire = {
+  plan_id: string;
+  goal: string;
+  steps: PlanDetailStepWire[];
+  conversation_id?: string | null;
+  created_at?: string;
+  overall_status: string;
+  ready_step_ids: string[];
+  recovery_required: string[];
+  awaiting_approval: string[];
+  needs_attention: boolean;
+};
+
+type PlanSummaryWire = {
+  plan_id: string;
+  goal: string;
+  created_at: string;
+  updated_at: string;
+  step_count: number;
+  status_counts: Record<string, number>;
+  recovery_required: string[];
+  awaiting_approval: string[];
+  needs_attention: boolean;
+};
+
+type PlanListWire = {
+  plans: PlanSummaryWire[];
+  total: number;
+  limit: number;
+  offset: number;
+};
+
+export function isPlanDetailStepWire(value: unknown): value is PlanDetailStepWire {
+  if (
+    !isRecord(value) ||
+    !isBoundedId(value["step_id"], 32, PLAN_STEP_ID_PATTERN) ||
+    typeof value["description"] !== "string" ||
+    value["description"].length === 0 ||
+    value["description"].length > 512 ||
+    !isBoundedString(value["tool_name"], 64)
+  ) {
+    return false;
+  }
+  const args = value["arguments"];
+  if (args !== undefined && !isBoundedStringMap(args, MAX_ACTION_ARGUMENTS, 128)) return false;
+  const result = value["result"];
+  if (result !== undefined && result !== null && !isToolResultWire(result)) return false;
+  return isPlanStepWire(value as unknown as Record<string, unknown>);
+}
+
+export function isPlanDetailWire(value: unknown): value is PlanDetailWire {
+  if (
+    !isRecord(value) ||
+    !isBoundedId(value["plan_id"], 64, PLAN_ID_PATTERN) ||
+    typeof value["goal"] !== "string" ||
+    value["goal"].length === 0 ||
+    value["goal"].length > 512 ||
+    typeof value["overall_status"] !== "string" ||
+    !PLAN_OVERALL_STATUSES.has(value["overall_status"])
+  ) {
+    return false;
+  }
+  const steps = value["steps"];
+  // Backend PlanDetail bounds: 1..8 ordered steps (openapi maxItems: 8).
+  if (!Array.isArray(steps) || steps.length === 0 || steps.length > 8) return false;
+  if (!steps.every((step) => isPlanDetailStepWire(step))) return false;
+  const conversationId = value["conversation_id"];
+  if (
+    conversationId !== undefined &&
+    conversationId !== null &&
+    !(typeof conversationId === "string" && conversationId.length > 0 && conversationId.length <= 128)
+  ) {
+    return false;
+  }
+  if (value["created_at"] !== undefined && !isBoundedIsoTimestamp(value["created_at"])) return false;
+  const listKeys = ["ready_step_ids", "recovery_required", "awaiting_approval"] as const;
+  for (const key of listKeys) {
+    const list = value[key];
+    if (
+      !Array.isArray(list) ||
+      list.length > MAX_PLAN_STEPS ||
+      !list.every((id) => isBoundedId(id, 32, /^[a-zA-Z0-9_]{1,32}$/))
+    ) {
+      return false;
+    }
+  }
+  return value["needs_attention"] === true || value["needs_attention"] === false;
+}
+
+export function isPlanListWire(value: unknown): value is PlanListWire {
+  if (!isRecord(value) || !isBoundedInt(value["total"], 0, Number.MAX_SAFE_INTEGER)) return false;
+  const plans = value["plans"];
+  if (!Array.isArray(plans) || plans.length > MAX_LIST_CONVERSATIONS) return false;
+  if (!plans.every((plan) => isPlanSummaryWire(plan))) return false;
+  return (
+    isBoundedInt(value["limit"], 1, Number.MAX_SAFE_INTEGER) &&
+    isBoundedInt(value["offset"], 0, Number.MAX_SAFE_INTEGER)
+  );
+}
+
+/**
+ * TaskPlan result of resolve-recovery: the base chat plan shape plus the
+ * optional conversation/creation metadata TaskPlan carries.
+ */
+type TaskPlanResultWire = TaskPlanWire & {
+  conversation_id?: string | null;
+  created_at?: string;
+};
+
+export function isTaskPlanResultWire(value: unknown): value is TaskPlanResultWire {
+  if (!isTaskPlanWire(value)) return false;
+  const conversationId = (value as Record<string, unknown>)["conversation_id"];
+  if (
+    conversationId !== undefined &&
+    conversationId !== null &&
+    !(typeof conversationId === "string" && conversationId.length > 0 && conversationId.length <= 128)
+  ) {
+    return false;
+  }
+  const createdAt = (value as Record<string, unknown>)["created_at"];
+  return createdAt === undefined || isBoundedIsoTimestamp(createdAt);
+}
+
+function isPlanSummaryWire(value: unknown): value is PlanSummaryWire {
+  if (
+    !isRecord(value) ||
+    !isBoundedId(value["plan_id"], 64, PLAN_ID_PATTERN) ||
+    typeof value["goal"] !== "string" ||
+    value["goal"].length === 0 ||
+    value["goal"].length > 512 ||
+    !isBoundedIsoTimestamp(value["created_at"]) ||
+    !isBoundedIsoTimestamp(value["updated_at"]) ||
+    !isBoundedInt(value["step_count"], 0, MAX_PLAN_STEPS)
+  ) {
+    return false;
+  }
+  const statusCounts = value["status_counts"];
+  if (
+    !isRecord(statusCounts) ||
+    Object.keys(statusCounts).length > 6 ||
+    !Object.values(statusCounts).every((count) => isBoundedInt(count, 0, MAX_PLAN_STEPS))
+  ) {
+    return false;
+  }
+  for (const key of ["recovery_required", "awaiting_approval"] as const) {
+    const list = value[key];
+    if (
+      !Array.isArray(list) ||
+      list.length > MAX_PLAN_STEPS ||
+      !list.every((id) => isBoundedId(id, 32, /^[a-zA-Z0-9_]{1,32}$/))
+    ) {
+      return false;
+    }
+  }
+  return value["needs_attention"] === true || value["needs_attention"] === false;
+}
+
+/* ------------------------------------------------------------------ */
 /* Wire → view projectors                                              */
 /* ------------------------------------------------------------------ */
 
@@ -517,6 +862,70 @@ function toConversationHistoryView(raw: ConversationHistoryWire): ConversationHi
     turns,
     turnCount: raw.turn_count,
     totalTurnCount: raw.total_turn_count,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* Approvals + plans wire → view projectors                             */
+/* ------------------------------------------------------------------ */
+
+function toApprovalSummaryView(raw: ApprovalSummaryWire): ApprovalSummaryView {
+  const status = typeof raw.status === "string" ? raw.status : "PENDING";
+  return {
+    approvalId: raw.approval_id,
+    toolName: raw.tool_name,
+    description: raw.action_description,
+    riskLevel: raw.risk_level as ApprovalSummaryView["riskLevel"],
+    status: status as ApprovalSummaryView["status"],
+    createdAt: typeof raw.created_at === "string" ? raw.created_at : "",
+    expiresAt: raw.expires_at,
+    resolvedAt: typeof raw.resolved_at === "string" ? raw.resolved_at : null,
+  };
+}
+
+function toApprovalRequestView(raw: ApprovalRequestWire): ApprovalRequestView {
+  return {
+    ...toApprovalSummaryView(raw),
+    arguments: raw.arguments ?? {},
+  };
+}
+
+function toToolExecutionView(raw: ToolResultWire): ToolExecutionView {
+  return {
+    toolName: raw.tool_name,
+    status: raw.status,
+    success: raw.success ?? (raw.status === "success" || raw.status === "already_exists"),
+    message: raw.message ?? "Tool execution completed.",
+    data: raw.data ?? null,
+    errorCode: raw.error_code ?? null,
+  };
+}
+
+function toPlanDetailStepView(raw: PlanDetailStepWire): PlanDetailStepView {
+  const status = typeof raw.status === "string" ? raw.status : "PENDING";
+  return {
+    stepId: raw.step_id,
+    description: raw.description,
+    toolName: raw.tool_name,
+    arguments: raw.arguments ? { ...raw.arguments } : {},
+    dependsOn: raw.depends_on ? [...raw.depends_on] : [],
+    status: status as PlanDetailStepView["status"],
+    approvalId: typeof raw.approval_id === "string" ? raw.approval_id : null,
+    result: raw.result && raw.result !== null ? toToolExecutionView(raw.result) : null,
+  };
+}
+
+function toPlanSummaryView(raw: PlanSummaryWire): PlanSummaryView {
+  return {
+    planId: raw.plan_id,
+    goal: raw.goal,
+    createdAt: raw.created_at,
+    updatedAt: raw.updated_at,
+    stepCount: raw.step_count,
+    statusCounts: { ...raw.status_counts },
+    recoveryRequired: [...raw.recovery_required],
+    awaitingApproval: [...raw.awaiting_approval],
+    needsAttention: raw.needs_attention,
   };
 }
 
@@ -697,6 +1106,214 @@ export class HttpBackendApiClient {
     );
     if (!result.ok) return result;
     return ipcOk<ConversationDeletedView>({ conversationId: result.data.conversation_id });
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Approvals (Phase 6.3 Part A)                                      */
+  /* ---------------------------------------------------------------- */
+
+  /** GET /api/approvals — metadata page; Arguments are never included. */
+  async listApprovals(
+    payload: { limit?: number; offset?: number } = {},
+    timeoutMs = APPROVALS_TIMEOUT_MS,
+  ): Promise<IpcResult<ApprovalListView>> {
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    const limit = payload.limit ?? CONVERSATION_LIST_LIMITS.default;
+    const offset = payload.offset ?? 0;
+    const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    const result = await this.requestJson<ApprovalListWire>(
+      `/api/approvals?${query.toString()}`,
+      timeoutMs,
+      isApprovalListWire,
+    );
+    if (!result.ok) return result;
+    return ipcOk<ApprovalListView>({
+      approvals: result.data.approvals.map(toApprovalSummaryView),
+      total: result.data.total,
+    });
+  }
+
+  /** GET /api/approvals/{id} — authoritative read (applies lazy expiration). */
+  async getApproval(
+    payload: { approvalId: string },
+    timeoutMs = APPROVALS_TIMEOUT_MS,
+  ): Promise<IpcResult<ApprovalRequestView>> {
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    if (!CONVERSATION_ID_PATTERN.test(payload.approvalId)) {
+      return ipcError("UNEXPECTED", "Internal error: invalid approval identifier.");
+    }
+    const result = await this.requestJson<ApprovalRequestWire>(
+      `/api/approvals/${encodeURIComponent(payload.approvalId)}`,
+      timeoutMs,
+      isApprovalRequestWire,
+    );
+    if (!result.ok) return result;
+    return ipcOk<ApprovalRequestView>(toApprovalRequestView(result.data));
+  }
+
+  /** POST /api/approvals/{id}/approve — consumes the request and executes it once. */
+  async approveApproval(
+    payload: { approvalId: string },
+    timeoutMs = APPROVAL_ACTION_TIMEOUT_MS,
+  ): Promise<IpcResult<ToolExecutionView>> {
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    if (!CONVERSATION_ID_PATTERN.test(payload.approvalId)) {
+      return ipcError("UNEXPECTED", "Internal error: invalid approval identifier.");
+    }
+    const result = await this.requestJson<ToolResultWire>(
+      `/api/approvals/${encodeURIComponent(payload.approvalId)}/approve`,
+      timeoutMs,
+      isToolResultWire,
+      { method: "POST" },
+    );
+    if (!result.ok) return result;
+    return ipcOk<ToolExecutionView>(toToolExecutionView(result.data));
+  }
+
+  /** POST /api/approvals/{id}/reject — terminal REJECTED state, no execution. */
+  async rejectApproval(
+    payload: { approvalId: string },
+    timeoutMs = APPROVALS_TIMEOUT_MS,
+  ): Promise<IpcResult<ApprovalRequestView>> {
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    if (!CONVERSATION_ID_PATTERN.test(payload.approvalId)) {
+      return ipcError("UNEXPECTED", "Internal error: invalid approval identifier.");
+    }
+    const result = await this.requestJson<ApprovalRequestWire>(
+      `/api/approvals/${encodeURIComponent(payload.approvalId)}/reject`,
+      timeoutMs,
+      isApprovalRequestWire,
+      { method: "POST" },
+    );
+    if (!result.ok) return result;
+    return ipcOk<ApprovalRequestView>(toApprovalRequestView(result.data));
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Plans (Phase 6.3 Part B)                                          */
+  /* ---------------------------------------------------------------- */
+
+  /** GET /api/plans — metadata page with backend attention flags. */
+  async listPlans(
+    payload: { limit?: number; offset?: number } = {},
+    timeoutMs = PLANS_TIMEOUT_MS,
+  ): Promise<IpcResult<PlanListView>> {
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    const limit = payload.limit ?? CONVERSATION_LIST_LIMITS.default;
+    const offset = payload.offset ?? 0;
+    const query = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    const result = await this.requestJson<PlanListWire>(
+      `/api/plans?${query.toString()}`,
+      timeoutMs,
+      isPlanListWire,
+    );
+    if (!result.ok) return result;
+    return ipcOk<PlanListView>({
+      plans: result.data.plans.map(toPlanSummaryView),
+      total: result.data.total,
+    });
+  }
+
+  /** GET /api/plans/{id} — authoritative read with backend-derived status. */
+  async getPlan(
+    payload: { planId: string },
+    timeoutMs = PLAN_DETAIL_TIMEOUT_MS,
+  ): Promise<IpcResult<PlanDetailView>> {
+    void PLAN_OVERALL_STATUSES; // enum pinned by the wire guard above
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    if (!PLAN_ID_PATTERN.test(payload.planId)) {
+      return ipcError("UNEXPECTED", "Internal error: invalid plan identifier.");
+    }
+    const result = await this.requestJson<PlanDetailWire>(
+      `/api/plans/${encodeURIComponent(payload.planId)}`,
+      timeoutMs,
+      isPlanDetailWire,
+    );
+    if (!result.ok) return result;
+    const raw = result.data;
+    return ipcOk<PlanDetailView>({
+      planId: raw.plan_id,
+      goal: raw.goal,
+      conversationId:
+        typeof raw.conversation_id === "string" ? raw.conversation_id : null,
+      createdAt: typeof raw.created_at === "string" ? raw.created_at : "",
+      overallStatus: raw.overall_status as PlanOverallStatusView,
+      steps: raw.steps.map(toPlanDetailStepView),
+      readyStepIds: [...raw.ready_step_ids],
+      recoveryRequired: [...raw.recovery_required],
+      awaitingApproval: [...raw.awaiting_approval],
+      needsAttention: raw.needs_attention,
+    });
+  }
+
+  /**
+   * POST /api/plans/{pid}/steps/{sid}/request — ONE attempt, no retries.
+   * 200 → executed ToolResult; 202 → created approval (nothing executed).
+   * Distinguished by response shape, exactly like the backend contract.
+   */
+  async requestPlanStep(
+    payload: { planId: string; stepId: string },
+    timeoutMs = PLAN_STEP_REQUEST_TIMEOUT_MS,
+  ): Promise<IpcResult<PlanStepRequestOutcomeView>> {
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    if (!PLAN_ID_PATTERN.test(payload.planId) || !PLAN_STEP_ID_PATTERN.test(payload.stepId)) {
+      return ipcError("UNEXPECTED", "Internal error: invalid plan step identifier.");
+    }
+    const path =
+      `/api/plans/${encodeURIComponent(payload.planId)}/steps/` +
+      `${encodeURIComponent(payload.stepId)}/request`;
+    const result = await this.requestJson<unknown>(path, timeoutMs, (value): value is unknown =>
+      isToolResultWire(value) || isApprovalRequestWire(value),
+    );
+    if (!result.ok) return result;
+    if (isToolResultWire(result.data)) {
+      return ipcOk<PlanStepRequestOutcomeView>({
+        kind: "executed",
+        execution: toToolExecutionView(result.data),
+      } as const);
+    }
+    return ipcOk<PlanStepRequestOutcomeView>({
+      kind: "approval_required",
+      approval: toApprovalRequestView(result.data as ApprovalRequestWire),
+    } as const);
+  }
+
+  /** POST /api/plans/{pid}/steps/{sid}/resolve-recovery — explicit human reconciliation. */
+  async resolvePlanRecovery(
+    payload: { planId: string; stepId: string },
+    timeoutMs = PLAN_RECOVERY_TIMEOUT_MS,
+  ): Promise<IpcResult<PlanRecoveryResolvedView>> {
+    const auth = this.requireAuth();
+    if (auth) return auth;
+    if (!PLAN_ID_PATTERN.test(payload.planId) || !PLAN_STEP_ID_PATTERN.test(payload.stepId)) {
+      return ipcError("UNEXPECTED", "Internal error: invalid plan step identifier.");
+    }
+    const path =
+      `/api/plans/${encodeURIComponent(payload.planId)}/steps/` +
+      `${encodeURIComponent(payload.stepId)}/resolve-recovery`;
+    const result = await this.requestJson<TaskPlanResultWire>(
+      path,
+      timeoutMs,
+      isTaskPlanResultWire,
+      { method: "POST" },
+    );
+    if (!result.ok) return result;
+    const raw = result.data;
+    return ipcOk<PlanRecoveryResolvedView>({
+      planId: raw.plan_id,
+      goal: raw.goal,
+      conversationId:
+        typeof raw["conversation_id"] === "string" ? raw["conversation_id"] : null,
+      createdAt: typeof raw["created_at"] === "string" ? raw["created_at"] : "",
+      steps: raw.steps.map(toPlanDetailStepView),
+    });
   }
 
   private async requestJson<T>(
