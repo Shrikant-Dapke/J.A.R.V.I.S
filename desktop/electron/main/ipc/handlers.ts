@@ -3,16 +3,31 @@
  * preloaded renderer into the pure dispatch registry and applies the
  * trusted-frame check from app-security (same allowlist as navigation:
  * the dev server origin in dev, the built index.html in dist hosting).
+ *
+ * Registration is driven by the shared PRELOAD_METHODS table, so a
+ * channel cannot be exposed in the preload yet forgotten here (or vice
+ * versa) — the parity is contract-tested too.
  */
 
 import { ipcMain, type IpcMainInvokeEvent } from "electron";
-import { createIpcRegistry, type IpcRegistry } from "./ipc-registry";
+import { createIpcRegistry, type IpcHandlers, type IpcRegistry } from "./ipc-registry";
 import type { HttpBackendApiClient } from "../api/client";
-import { ipcOk, type BackendStatus } from "../../../shared/ipc-contract";
 import {
+  DEFAULT_CHAT_TIMEOUT_MS,
+  DEFAULT_CONVERSATIONS_TIMEOUT_MS,
+  DEFAULT_DELETE_TIMEOUT_MS,
   DEFAULT_HEALTH_TIMEOUT_MS,
+  DEFAULT_HISTORY_TIMEOUT_MS,
   DEFAULT_SYSTEM_INFO_TIMEOUT_MS,
 } from "../api/client";
+import {
+  ipcOk,
+  PRELOAD_METHODS,
+  type BackendStatus,
+  type ChatSendPayload,
+  type ConversationIdPayload,
+  type ConversationListPayload,
+} from "../../../shared/ipc-contract";
 import { shouldAllowNavigation } from "../app-security";
 
 export type IpcHandlerDeps = {
@@ -31,26 +46,29 @@ function callerUrl(event: IpcMainInvokeEvent): string | null {
 }
 
 export function createJarvisIpcRegistry(deps: IpcHandlerDeps): IpcRegistry {
-  return createIpcRegistry(
-    {
-      "jarvis:backend-status": async () => ipcOk(deps.getStatus()),
-      "jarvis:check-health": async () => deps.client.getHealth(DEFAULT_HEALTH_TIMEOUT_MS),
-      "jarvis:get-system-info": async () =>
-        deps.client.getSystemInfo(DEFAULT_SYSTEM_INFO_TIMEOUT_MS),
-    },
-    (url) => shouldAllowNavigation(url ?? "", deps.navigationTrust),
+  const handlers: IpcHandlers = {
+    "jarvis:backend-status": async () => ipcOk(deps.getStatus()),
+    "jarvis:check-health": async () => deps.client.getHealth(DEFAULT_HEALTH_TIMEOUT_MS),
+    "jarvis:get-system-info": async () => deps.client.getSystemInfo(DEFAULT_SYSTEM_INFO_TIMEOUT_MS),
+    "jarvis:send-chat": async (payload: ChatSendPayload) =>
+      deps.client.sendChat(payload, DEFAULT_CHAT_TIMEOUT_MS),
+    "jarvis:list-conversations": async (payload: ConversationListPayload) =>
+      deps.client.listConversations(payload, DEFAULT_CONVERSATIONS_TIMEOUT_MS),
+    "jarvis:get-conversation": async (payload: ConversationIdPayload) =>
+      deps.client.getConversation(payload, DEFAULT_HISTORY_TIMEOUT_MS),
+    "jarvis:delete-conversation": async (payload: ConversationIdPayload) =>
+      deps.client.deleteConversation(payload, DEFAULT_DELETE_TIMEOUT_MS),
+  };
+  return createIpcRegistry(handlers, (url) =>
+    shouldAllowNavigation(url ?? "", deps.navigationTrust),
   );
 }
 
 /** Attach the registry to Electron's process-global ipcMain. */
 export function registerIpcHandlers(registry: IpcRegistry): void {
-  ipcMain.handle("jarvis:backend-status", (event, payload) =>
-    registry.dispatch("jarvis:backend-status", payload, callerUrl(event)),
-  );
-  ipcMain.handle("jarvis:check-health", (event, payload) =>
-    registry.dispatch("jarvis:check-health", payload, callerUrl(event)),
-  );
-  ipcMain.handle("jarvis:get-system-info", (event, payload) =>
-    registry.dispatch("jarvis:get-system-info", payload, callerUrl(event)),
-  );
+  for (const { channel } of PRELOAD_METHODS) {
+    ipcMain.handle(channel, (event, payload) =>
+      registry.dispatch(channel, payload, callerUrl(event)),
+    );
+  }
 }

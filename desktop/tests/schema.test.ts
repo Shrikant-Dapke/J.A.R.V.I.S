@@ -126,6 +126,64 @@ test("response/request schemas the UI consumes exist with expected shapes", () =
   }
 });
 
+test("chat request contract: bounded 1..4000 message, optional conversation", () => {
+  const spec = loadSpec();
+  const chatRequest = spec.components.schemas["ChatRequest"] as {
+    required: string[];
+    properties: {
+      message: { maxLength: number; minLength: number };
+      conversation_id?: unknown;
+    };
+  };
+  assert.ok(chatRequest, "ChatRequest schema present");
+  assert.deepEqual(chatRequest.required, ["message"], "conversation_id is optional");
+  assert.equal(chatRequest.properties.message.maxLength, 4000);
+  assert.equal(chatRequest.properties.message.minLength, 1);
+  assert.ok("conversation_id" in chatRequest.properties);
+});
+
+test("conversation list/history/clear contracts match the client wire guards", () => {
+  const spec = loadSpec();
+  const schemas = spec.components.schemas;
+
+  const list = schemas["ConversationListResponse"] as {
+    required: string[];
+    properties: Record<string, { enum?: string[] }>;
+  };
+  assert.ok(list, "ConversationListResponse schema present");
+  for (const field of ["conversations", "total", "limit", "offset"]) {
+    assert.ok(list.required.includes(field), `ConversationListResponse requires ${field}`);
+  }
+
+  const history = schemas["ConversationHistoryResponse"] as {
+    required: string[];
+    properties: Record<string, unknown>;
+  };
+  assert.ok(history, "ConversationHistoryResponse schema present");
+  for (const field of ["conversation_id", "turns", "turn_count", "total_turn_count"]) {
+    assert.ok(history.required.includes(field), `ConversationHistoryResponse requires ${field}`);
+  }
+
+  const clear = schemas["ConversationClearResponse"] as {
+    required: string[];
+    properties: { status: { const?: string } };
+  };
+  assert.ok(clear, "ConversationClearResponse schema present");
+  assert.deepEqual(clear.required, ["conversation_id"]);
+  assert.equal(clear.properties.status.const, "deleted", "clear status pins to 'deleted'");
+
+  // Page-size bounds live on the GET /api/conversations query parameter,
+  // not on the response schema.
+  const listOp = spec.paths["/api/conversations"]?.["get"];
+  assert.ok(listOp, "GET /api/conversations must exist");
+  const limitParam = listOp.parameters?.find((parameter) => parameter.name === "limit") as
+    | { schema?: { minimum?: number; maximum?: number } }
+    | undefined;
+  assert.ok(limitParam?.schema, "limit query parameter documents its schema");
+  assert.equal(limitParam.schema?.minimum, 1, "page size lower bound documents 1");
+  assert.equal(limitParam.schema?.maximum, 200, "page size upper bound documents 200");
+});
+
 test("the generated typed module matches the snapshot", () => {
   const generated = readFileSync(
     resolve(DESKTOP_ROOT, "electron", "main", "api", "schema.gen.ts"),

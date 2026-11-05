@@ -8,6 +8,13 @@
 import {
   IPC_ERROR_COPY,
   type BackendStatus,
+  type ChatExchange,
+  type ChatSendPayload,
+  type ConversationDeletedView,
+  type ConversationHistoryView,
+  type ConversationIdPayload,
+  type ConversationListPayload,
+  type ConversationListView,
   type HealthCheck,
   type IpcErrorCode,
   type IpcResult,
@@ -68,4 +75,37 @@ export async function fetchHealthCheck(): Promise<IpcResult<HealthCheck>> {
 
 export async function fetchSystemInfo(): Promise<IpcResult<SystemInfoSummary>> {
   return asIpcResult<SystemInfoSummary>(BRIDGE_CONTEXT, await resolveBridge().getSystemInfo());
+}
+
+export async function sendChatMessage(
+  payload: ChatSendPayload,
+): Promise<IpcResult<ChatExchange>> {
+  return asIpcResult<ChatExchange>(BRIDGE_CONTEXT, await resolveBridge().sendChat(payload));
+}
+
+export async function fetchConversations(
+  payload: ConversationListPayload = {},
+): Promise<IpcResult<ConversationListView>> {
+  return asIpcResult<ConversationListView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().listConversations(payload),
+  );
+}
+
+export async function fetchConversation(
+  payload: ConversationIdPayload,
+): Promise<IpcResult<ConversationHistoryView>> {
+  return asIpcResult<ConversationHistoryView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().getConversation(payload),
+  );
+}
+
+export async function deleteConversationById(
+  payload: ConversationIdPayload,
+): Promise<IpcResult<ConversationDeletedView>> {
+  return asIpcResult<ConversationDeletedView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().deleteConversation(payload),
+  );
 }

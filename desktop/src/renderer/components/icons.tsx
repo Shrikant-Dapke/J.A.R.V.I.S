@@ -92,3 +92,29 @@ export function CloseIcon(props: IconProps) {
     </Base>
   );
 }
+
+export function PlusIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <path d="M12 5v14M5 12h14" />
+    </Base>
+  );
+}
+
+export function SendIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <path d="m4 11 16-7-7 16-2.5-6.5L4 11Z" />
+    </Base>
+  );
+}
+
+export function TrashIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+      <path d="M6 7l1 12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-12" />
+      <path d="M10 11v6M14 11v6" />
+    </Base>
+  );
+}

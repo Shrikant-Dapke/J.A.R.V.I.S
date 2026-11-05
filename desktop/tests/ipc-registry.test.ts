@@ -1,49 +1,43 @@
-/** IPC registry + preload bridge contract tests. */
+/** IPC registry + preload bridge contract tests (7 channels, per-channel payloads). */
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
   IPC_CHANNELS,
+  PAYLOAD_VALIDATORS,
   ipcOk,
   PRELOAD_METHODS,
-  type EmptyPayload,
   type IpcChannel,
+  type IpcPayloadMap,
   type IpcResult,
 } from "../shared/ipc-contract";
-import {
-  createIpcRegistry,
-  isEmptyPayload,
-  type IpcHandler,
-} from "../electron/main/ipc/ipc-registry";
+import { createIpcRegistry, type IpcHandlers } from "../electron/main/ipc/ipc-registry";
 
-function override(handlers: Record<IpcChannel, IpcHandler>, key: IpcChannel, value: IpcHandler) {
-  const next: Record<IpcChannel, IpcHandler> = { ...handlers };
-  next[key] = value;
-  return next;
-}
-
-function echo(result: unknown): IpcHandler {
-  return async (_payload: EmptyPayload) => ipcOk(result);
-}
-
-const HANDLERS: Record<IpcChannel, IpcHandler> = {
-  "jarvis:backend-status": echo({ apiOrigin: "http://127.0.0.1:8000" }),
-  "jarvis:check-health": echo({ name: "JARVIS", status: "healthy", version: "0.1.0" }),
-  "jarvis:get-system-info": echo({ toolName: "get_system_info" }),
+/** Every channel echoes a distinct marker so tests can identify routing. */
+const HANDLERS: IpcHandlers = {
+  "jarvis:backend-status": async () => ipcOk({ channel: "backend-status" }),
+  "jarvis:check-health": async () => ipcOk({ channel: "check-health" }),
+  "jarvis:get-system-info": async () => ipcOk({ channel: "get-system-info" }),
+  "jarvis:send-chat": async (payload) => ipcOk({ channel: "send-chat", payload }),
+  "jarvis:list-conversations": async (payload) => ipcOk({ channel: "list-conversations", payload }),
+  "jarvis:get-conversation": async (payload) => ipcOk({ channel: "get-conversation", payload }),
+  "jarvis:delete-conversation": async (payload) =>
+    ipcOk({ channel: "delete-conversation", payload }),
 };
 
-function trusted(): boolean {
-  return true;
+const VALID_UUID = "123e4567-e89b-12d3-a456-426614174000";
+const trusted = () => true;
+const untrusted = () => false;
+
+function dispatch(channel: IpcChannel, payload: unknown, url = "http://127.0.0.1:5173/") {
+  return createIpcRegistry(HANDLERS, trusted).dispatch(channel, payload, url);
 }
 
-function untrusted(): boolean {
-  return false;
-}
-
-test("preload bridge covers every registered channel exactly", () => {
+test("preload bridge covers every registered channel exactly (7 channels)", () => {
   const channels = PRELOAD_METHODS.map((m) => m.channel);
   const registered = Object.values(IPC_CHANNELS);
   assert.equal(channels.length, registered.length);
+  assert.equal(channels.length, 7);
   assert.deepEqual([...channels].sort(), [...registered].sort());
   for (const method of PRELOAD_METHODS) {
     assert.match(method.channel, /^jarvis:/);
@@ -51,9 +45,17 @@ test("preload bridge covers every registered channel exactly", () => {
   }
 });
 
+test("every channel has a payload validator in the shared table", () => {
+  for (const channel of Object.values(IPC_CHANNELS)) {
+    const validator = PAYLOAD_VALIDATORS[channel as keyof IpcPayloadMap];
+    assert.equal(typeof validator, "function", `missing validator for ${channel}`);
+  }
+  assert.equal(Object.keys(PAYLOAD_VALIDATORS).length, 7);
+});
+
 test("dispatch passes the handler envelope through without re-wrapping", async () => {
   const registry = createIpcRegistry(
-    override(HANDLERS, "jarvis:backend-status", async () => ipcOk({ nested: true })),
+    { ...HANDLERS, "jarvis:backend-status": async () => ipcOk({ nested: true }) },
     trusted,
   );
   const result = await registry.dispatch("jarvis:backend-status", {}, "http://127.0.0.1:5173/");
@@ -76,33 +78,135 @@ test("unauthorized calling frames are rejected before payload handling", async (
   assert.equal(result.ok ? null : result.code, "UNAUTHORIZED_FRAME");
 });
 
-test("payloads must be empty, plain objects", async () => {
-  const registry = createIpcRegistry(HANDLERS, trusted);
-  for (const bad of [{ sneaky: "keys" }, [1, 2, 3], "text", 42, null]) {
-    const result = await registry.dispatch("jarvis:check-health", bad, "http://127.0.0.1:5173/");
-    assert.equal(result.ok, false);
-    assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD");
+test("chat payload validation covers size, shape, and id rules", async () => {
+  const happy = {
+    message: "status report",
+    conversationId: null,
+  };
+  const ok = (await dispatch("jarvis:send-chat", happy)) as IpcResult<{
+    channel: string;
+    payload: { message: string; conversationId: string | null };
+  }>;
+  assert.equal(ok.ok, true);
+  if (ok.ok) {
+    assert.equal(ok.data.payload.message, "status report");
+    assert.equal(ok.data.payload.conversationId, null);
   }
-  const passes: IpcResult<unknown> = await registry.dispatch(
+
+  const badMessage = (await dispatch("jarvis:send-chat", {
+    message: "   ",
+    conversationId: null,
+  })) as IpcResult<never>;
+  assert.equal(badMessage.ok ? null : badMessage.code, "BAD_PAYLOAD");
+
+  const oversized = (await dispatch("jarvis:send-chat", {
+    message: "x".repeat(4001),
+    conversationId: null,
+  })) as IpcResult<never>;
+  assert.equal(oversized.ok ? null : oversized.code, "BAD_PAYLOAD");
+
+  const badId = (await dispatch("jarvis:send-chat", {
+    message: "hello",
+    conversationId: "not-a-uuid",
+  })) as IpcResult<never>;
+  assert.equal(badId.ok ? null : badId.code, "BAD_PAYLOAD");
+
+  // Extra keys are rejected (payload smuggling guard).
+  const extraKeys = (await dispatch("jarvis:send-chat", {
+    message: "hello",
+    conversationId: null,
+    role: "system",
+  })) as IpcResult<never>;
+  assert.equal(extraKeys.ok ? null : extraKeys.code, "BAD_PAYLOAD");
+
+  // Exactly the two contract keys, in any order, with a valid uuid.
+  const withId = (await dispatch("jarvis:send-chat", {
+    conversationId: VALID_UUID,
+    message: "  hello  ",
+  })) as IpcResult<{ payload: { message: string; conversationId: string } }>;
+  assert.equal(withId.ok, true);
+  if (withId.ok) {
+    assert.equal(withId.data.payload.message, "hello", "message is trimmed at the wire");
+    assert.equal(withId.data.payload.conversationId, VALID_UUID);
+  }
+});
+
+test("conversation list payload bounds mirror the backend page limits", async () => {
+  const ok = (await dispatch("jarvis:list-conversations", { limit: 50, offset: 0 })) as IpcResult<{
+    payload: { limit?: number; offset?: number };
+  }>;
+  assert.equal(ok.ok, true);
+  if (ok.ok) assert.deepEqual(ok.data.payload, { limit: 50, offset: 0 });
+
+  const empty = await dispatch("jarvis:list-conversations", {});
+  assert.equal(empty.ok, true);
+  const undefinedPayload = await dispatch("jarvis:list-conversations", undefined);
+  assert.equal(undefinedPayload.ok, true);
+
+  for (const badLimit of [0, 201, 12.5, "50", null]) {
+    const result = (await dispatch("jarvis:list-conversations", { limit: badLimit })) as IpcResult<
+      never
+    >;
+    assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `limit ${String(badLimit)}`);
+  }
+  const badOffset = (await dispatch("jarvis:list-conversations", {
+    offset: -1,
+  })) as IpcResult<never>;
+  assert.equal(badOffset.ok ? null : badOffset.code, "BAD_PAYLOAD");
+  const extra = (await dispatch("jarvis:list-conversations", {
+    limit: 50,
+    sneaky: true,
+  })) as IpcResult<never>;
+  assert.equal(extra.ok ? null : extra.code, "BAD_PAYLOAD");
+});
+
+test("conversation id payloads require a strict backend uuid", async () => {
+  for (const channel of ["jarvis:get-conversation", "jarvis:delete-conversation"] as const) {
+    const ok = (await dispatch(channel, { conversationId: VALID_UUID })) as IpcResult<{
+      payload: { conversationId: string };
+    }>;
+    assert.equal(ok.ok, true, channel);
+    if (ok.ok) assert.equal(ok.data.payload.conversationId, VALID_UUID);
+
+    for (const bad of ["", "123", "not-a-uuid", null, 42]) {
+      const result = (await dispatch(channel, { conversationId: bad })) as IpcResult<never>;
+      assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `${channel} id ${String(bad)}`);
+    }
+    const emptyPayload = (await dispatch(channel, {})) as IpcResult<never>;
+    assert.equal(emptyPayload.ok ? null : emptyPayload.code, "BAD_PAYLOAD");
+  }
+});
+
+test("empty-payload channels reject anything but an empty object", async () => {
+  for (const channel of [
+    "jarvis:backend-status",
     "jarvis:check-health",
-    undefined,
-    "http://127.0.0.1:5173/",
-  );
-  assert.equal(passes.ok, true);
+    "jarvis:get-system-info",
+  ] as const) {
+    for (const bad of [{ sneaky: "keys" }, [1, 2, 3], "text", 42, null]) {
+      const result = (await dispatch(channel, bad)) as IpcResult<never>;
+      assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `${channel} ${String(bad)}`);
+    }
+    const passes = await dispatch(channel, undefined);
+    assert.equal(passes.ok, true, channel);
+  }
 });
 
 test("handler crashes collapse to bounded UNEXPECTED failures", async () => {
   const registry = createIpcRegistry(
-    override(
-      HANDLERS,
-      "jarvis:backend-status",
-      async () => {
+    {
+      ...HANDLERS,
+      "jarvis:send-chat": async () => {
         throw new Error("handler stack should never reach the renderer");
       },
-    ),
+    },
     trusted,
   );
-  const result = await registry.dispatch("jarvis:backend-status", {}, "http://127.0.0.1:5173/");
+  const result = await registry.dispatch(
+    "jarvis:send-chat",
+    { message: "hello", conversationId: null },
+    "http://127.0.0.1:5173/",
+  );
   assert.equal(result.ok, false);
   assert.equal(result.ok ? null : result.code, "UNEXPECTED");
   if (!result.ok) {
@@ -113,13 +217,4 @@ test("handler crashes collapse to bounded UNEXPECTED failures", async () => {
     );
     assert.match(result.message, /unexpected failure/u, "fixed, non-sensitive text only");
   }
-});
-
-test("isEmptyPayload is strict", () => {
-  assert.equal(isEmptyPayload(undefined), true);
-  assert.equal(isEmptyPayload({}), true);
-  assert.equal(isEmptyPayload({ a: 1 }), false);
-  assert.equal(isEmptyPayload([]), false);
-  assert.equal(isEmptyPayload(null), false);
-  assert.equal(isEmptyPayload("x"), false);
 });

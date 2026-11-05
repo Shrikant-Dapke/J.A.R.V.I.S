@@ -1,4 +1,4 @@
-# JARVIS Desktop (Phase 6.1 — Foundation)
+# JARVIS Desktop (Phase 6.2 — Functional Chat)
 
 Electron desktop shell for J.A.R.V.I.S. The renderer has **no network access**:
 every backend call runs in the Electron main process over a narrow, typed IPC
@@ -83,9 +83,13 @@ Invariants, enforced by construction and pinned by contract tests (`desktop/test
   (`electron/main/net.ts`) before any socket is opened. No `Origin` header is
   sent (native client semantics expected by `require_safe_origin`).
 - IPC dispatch (pure registry, plain-Node testable) rejects: unknown channels,
-  untrusted caller frames, non-empty payloads. Handler crashes collapse to a
-  fixed, non-sensitive `UNEXPECTED` message; internal error text stays in the
-  main-process console only.
+  untrusted caller frames, and payloads failing that channel's validator.
+  Handler crashes collapse to a fixed, non-sensitive `UNEXPECTED` message;
+  internal error text stays in the main-process console only.
+- Chat message bounds (1–4000 chars) are enforced at every layer: composer
+  (hard cap), IPC payload validator, and a final client-side wire check.
+- Conversation identifiers are validated as backend uuids before they can
+  appear in any request path (client guard, not just UI selection).
 
 ---
 
@@ -94,11 +98,18 @@ Invariants, enforced by construction and pinned by contract tests (`desktop/test
 `desktop/shared/ipc-contract.ts` is the single source of truth, consumed by
 the registry, the preload, the renderer, and the tests:
 
-| Method          | Channel                    | Payload | Result wire type        |
-| --------------- | -------------------------- | ------- | ----------------------- |
-| `backendStatus` | `jarvis:backend-status`    | `{}`    | `BackendStatus`         |
-| `checkHealth`   | `jarvis:check-health`      | `{}`    | `HealthCheck`           |
-| `getSystemInfo` | `jarvis:get-system-info`   | `{}`    | `SystemInfoSummary`     |
+| Method               | Channel                       | Payload                                      | Result wire type            |
+| -------------------- | ----------------------------- | -------------------------------------------- | --------------------------- |
+| `backendStatus`      | `jarvis:backend-status`       | `{}`                                         | `BackendStatus`             |
+| `checkHealth`        | `jarvis:check-health`         | `{}`                                         | `HealthCheck`               |
+| `getSystemInfo`      | `jarvis:get-system-info`      | `{}`                                         | `SystemInfoSummary`         |
+| `sendChat`           | `jarvis:send-chat`            | `{ message, conversationId \| null }`        | `ChatExchange`              |
+| `listConversations`  | `jarvis:list-conversations`   | `{ limit? ≤200, offset? }`                   | `ConversationListView`      |
+| `getConversation`    | `jarvis:get-conversation`     | `{ conversationId }` (uuid)                  | `ConversationHistoryView`   |
+| `deleteConversation` | `jarvis:delete-conversation`  | `{ conversationId }` (uuid)                  | `ConversationDeletedView`   |
+
+Every channel declares a validator in `PAYLOAD_VALIDATORS`; the registry
+rejects anything the validator refuses (`BAD_PAYLOAD`) before a handler runs.
 
 All results share the `IpcResult<T>` envelope (`{ ok: true, data }` or
 `{ ok: false, code, message, httpStatus? }`) with the error-code table
@@ -129,7 +140,7 @@ route, unauthenticated health/root, schema presence).
 | `test` 🔎              | compile pure modules → `node --test` contract suite             |
 | `verify`               | typecheck + test + build (the acceptance gate)                  |
 
-Tests (36) run in plain Node against the compiled **pure** modules — no
+Tests (71) run in plain Node against the compiled **pure** modules — no
 Electron runtime needed. Electron glue (`main.ts`, `handlers.ts`, preload) is
 kept thin on purpose so everything security-relevant is testable.
 
@@ -150,19 +161,49 @@ Dark futuristic HUD shell (`src/renderer`):
 - Live data: `useBackendMonitor` (status + health, 30 s poll, manual refresh)
   and `useSystemInfo` (auth-gated `get_system_info` tool read).
 
-Phase 6.1 scope is honest by design: Console, Approvals, and Plans surfaces
-are explicit placeholders that state their Phase 6.2 contracts — no fake
-data, no streaming, no voice, no non-functional controls.
+Phase 6.1 scope is honest by design: the Approvals and Plans surfaces are
+explicit placeholders that state their Phase 6.3 contracts — no fake data,
+no streaming, no voice, no non-functional controls.
 
----
+## Chat console (Phase 6.2, fully functional)
 
-## Phase 6.2 backlog (not in this build)
+The Console view is a complete AI conversation interface over the typed IPC
+bridge:
 
-- Chat turn pipeline over `POST /api/chat` (success | action_proposed |
-  plan_proposed), bounded message/replay envelopes.
+- **Conversation lifecycle** — rail of past conversations (metadata only:
+  time, turn count, id), New Chat, refresh, delete with inline confirmation.
+  Switching or deleting is locked while a reply is in flight.
+- **Chat UX** — asymmetric bubbles with timestamps, multiline composer
+  (Enter sends, Shift+Enter newline, IME-safe), hard 4000-char counter with a
+  near-limit warning, auto-resizing input, stick-to-bottom auto-scroll that
+  yields when the user scrolls up, welcome screen with example prompts.
+- **Honest request lifecycle** — optimistic pending user bubble → thinking
+  indicator → real assistant turn (never a mock or simulated stream). Failed
+  sends keep the bubble, mark it visibly failed, and restore the exact text
+  to the composer: the user's message is never lost. Submissions are
+  serialized by a gate (`shared/chat-engine.ts`); there is no automatic
+  retry anywhere — a failed turn stays failed until the user resends.
+- **Backend statuses rendered structurally** — `action_proposed` (proposal
+  card: tool, risk level, approval state, bounded arguments, expiry) and
+  `plan_proposed` (step list with statuses/dependencies), plus executed
+  read-only tool results. Nothing executes from the chat surface; execution
+  belongs to the backend approval/plan flows.
+- **Error surfaces** — chat-specific copy per `IpcErrorCode` (policy denial,
+  provider outage, capacity, validation, timeout, unreachable) composed from
+  the backend's structured `error.message` + `HTTP_STATUS_HINTS` meaning.
+- **Pure core** — `shared/chat-engine.ts` holds the reducer (session
+  transitions), the submission gate, and message factories with zero
+  React/Electron imports so all chat invariants are plain-Node testable
+  (`tests/chat-engine.test.ts`); the React hooks only wire the engine to
+  state and the bridge.
+
+Chat sends are blocked with an explicit banner when the token is not
+configured (`tokenConfigured === false` from the main-process status).
+
+## Phase 6.3 backlog (not in this build)
+
 - Approval workspace: inventory (advisory) → authoritative detail reads →
   approve/reject single-use, TTL-bound actions; unchanged backend policy.
 - Plans workspace: authoritative plan/steps, one-step-per-request execution,
   recovery reconciliation.
-- Conversations inventory + clear.
 - Packaging (electron-builder), code signing, auto-update policy.

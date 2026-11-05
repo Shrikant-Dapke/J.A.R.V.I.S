@@ -1,7 +1,8 @@
 /**
- * Application shell (Phase 6.1): dark HUD framework with sidebar
- * navigation, scrollable workspace, and a live right-side context
- * panel. Every control on screen performs a real action.
+ * Application shell: dark HUD framework with sidebar navigation,
+ * scrollable workspace, and a live right-side context panel. Since
+ * Phase 6.2 the Console view is a full-height functional chat workspace
+ * (no page scrolling); every control on screen performs a real action.
  */
 
 import { useState } from "react";
@@ -50,7 +51,7 @@ function BrandMark() {
       <span>
         <span className="block font-mono text-[13px] tracking-[0.3em] text-slate-100">JARVIS</span>
         <span className="block font-mono text-[9px] uppercase tracking-[0.24em] text-slate-500">
-          Phase 6.1 · Foundation
+          Phase 6.2 · Console
         </span>
       </span>
     </div>
@@ -252,11 +253,17 @@ export function App() {
           </div>
         </header>
 
-        <main className="scroll-hud min-h-0 flex-1 p-6">
+        <main
+          className={
+            view === "chat"
+              ? "flex min-h-0 flex-1 overflow-hidden"
+              : "scroll-hud min-h-0 flex-1 overflow-y-auto p-6"
+          }
+        >
           {view === "system" ? (
             <SystemStatusView monitor={monitor} />
           ) : view === "chat" ? (
-            <ChatView health={monitor.health} />
+            <ChatView monitor={monitor} />
           ) : view === "approvals" ? (
             <ApprovalsView health={monitor.health} />
           ) : (
