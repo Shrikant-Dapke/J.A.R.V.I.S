@@ -31,6 +31,7 @@ import { pcm16BytesToFloat32 } from "../../../shared/voice-audio";
 import { VOICE_ERROR_COPY } from "../../../shared/voice-engine";
 import { shouldAllowNavigation } from "../app-security";
 import type { VoiceEngine } from "../voice/voice-engine";
+import { createMicSequenceGate } from "../voice/mic-sequence-gate";
 
 export type IpcHandlerDeps = {
   client: HttpBackendApiClient;
@@ -58,6 +59,7 @@ function voiceOutcomeToIpc(outcome: Awaited<ReturnType<VoiceEngine["arm"]>>): Ip
 }
 
 export function createJarvisIpcRegistry(deps: IpcHandlerDeps): IpcRegistry {
+  const micSequenceGate = createMicSequenceGate();
   const handlers: IpcHandlers = {
     "jarvis:backend-status": async () => ipcOk(deps.getStatus()),
     "jarvis:check-health": async () => deps.client.getHealth(DEFAULT_HEALTH_TIMEOUT_MS),
@@ -108,13 +110,17 @@ export function createJarvisIpcRegistry(deps: IpcHandlerDeps): IpcRegistry {
       if (!deps.voice) {
         return ipcError("ENGINE_UNAVAILABLE", VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"]);
       }
-      return voiceOutcomeToIpc(await deps.voice.arm());
+      const armed = await deps.voice.arm();
+      if (armed.ok) micSequenceGate.reset();
+      return voiceOutcomeToIpc(armed);
     },
     "jarvis:voice-begin": async () => {
       if (!deps.voice) {
         return ipcError("ENGINE_UNAVAILABLE", VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"]);
       }
-      return voiceOutcomeToIpc(await deps.voice.begin());
+      const begun = await deps.voice.begin();
+      if (begun.ok) micSequenceGate.reset();
+      return voiceOutcomeToIpc(begun);
     },
     "jarvis:voice-end": async () => {
       if (!deps.voice) {
@@ -134,6 +140,12 @@ export function createJarvisIpcRegistry(deps: IpcHandlerDeps): IpcRegistry {
     "jarvis:voice-feed": async (payload: VoiceFeedPayload) => {
       if (!deps.voice) {
         return ipcError("ENGINE_UNAVAILABLE", VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"]);
+      }
+      const sequence = micSequenceGate.accept(payload.sequence);
+      if (!sequence.accepted) {
+        // Replays are idempotent: acknowledge the duplicate without
+        // feeding the recognizer a second time.
+        return ipcOk({});
       }
       // The channel validator has already bounded the chunk (PCM16 LE,
       // even byte count, ≤ VOICE_PCM_CHUNK_MAX_BYTES; sequence legality

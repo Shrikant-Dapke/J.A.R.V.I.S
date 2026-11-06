@@ -19,6 +19,7 @@ import {
   type ConversationIdPayload,
   type ConversationListPayload,
   type ConversationListView,
+  type EmptyPayload,
   type HealthCheck,
   type IpcErrorCode,
   type IpcResult,
@@ -31,7 +32,10 @@ import {
   type PlanStepRequestOutcomeView,
   type SystemInfoSummary,
   type ToolExecutionView,
+  type VoiceFeedPayload,
+  type VoiceStatusView,
 } from "../../../shared/ipc-contract";
+import type { VoiceEventPayload } from "../../../shared/voice-engine";
 
 export class UnexpectedBridgeError extends Error {
   readonly context: string;
@@ -179,4 +183,39 @@ export async function resolvePlanRecoveryStep(
     BRIDGE_CONTEXT,
     await resolveBridge().resolvePlanRecovery(payload),
   );
+}
+
+export async function voiceArm(): Promise<IpcResult<EmptyPayload>> {
+  return asIpcResult<EmptyPayload>(BRIDGE_CONTEXT, await resolveBridge().voiceArm());
+}
+
+export async function voiceBegin(): Promise<IpcResult<EmptyPayload>> {
+  return asIpcResult<EmptyPayload>(BRIDGE_CONTEXT, await resolveBridge().voiceBegin());
+}
+
+export async function voiceFeed(
+  payload: VoiceFeedPayload,
+): Promise<IpcResult<EmptyPayload>> {
+  return asIpcResult<EmptyPayload>(BRIDGE_CONTEXT, await resolveBridge().voiceFeed(payload));
+}
+
+export async function voiceEnd(): Promise<IpcResult<EmptyPayload>> {
+  return asIpcResult<EmptyPayload>(BRIDGE_CONTEXT, await resolveBridge().voiceEnd());
+}
+
+export async function voiceCancel(): Promise<IpcResult<EmptyPayload>> {
+  return asIpcResult<EmptyPayload>(BRIDGE_CONTEXT, await resolveBridge().voiceCancel());
+}
+
+export async function prepareVoiceModels(): Promise<IpcResult<VoiceStatusView>> {
+  return asIpcResult<VoiceStatusView>(
+    BRIDGE_CONTEXT,
+    await resolveBridge().voicePrepareModels(),
+  );
+}
+
+export function subscribeVoiceEvents(
+  listener: (event: VoiceEventPayload) => void,
+): () => void {
+  return resolveBridge().onVoiceEvent(listener);
 }

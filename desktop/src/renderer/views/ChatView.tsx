@@ -5,7 +5,7 @@
  * is never lost; sends are serialized and never retried automatically.
  */
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { ChatComposer } from "../components/chat/ChatComposer";
 import { ChatTranscript } from "../components/chat/ChatTranscript";
 import { ConversationRail } from "../components/chat/ConversationRail";
@@ -13,9 +13,11 @@ import { CloseIcon, MenuIcon } from "../components/icons";
 import { Badge } from "../components/primitives";
 import { useChatSession, type SendOutcome } from "../hooks/useChatSession";
 import { useConversations } from "../hooks/useConversations";
+import { useMicCapture } from "../hooks/useMicCapture";
 import type { BackendMonitor } from "../hooks/useBackendMonitor";
 import { CHAT_MESSAGE_MAX_LENGTH } from "../../../shared/ipc-contract";
 import { cn } from "../lib/cn";
+import { mergeVoiceTranscript } from "../../../shared/voice-capture";
 
 function shortId(conversationId: string | null): string {
   if (!conversationId) return "New conversation";
@@ -46,6 +48,10 @@ export function ChatView({ monitor }: { monitor: BackendMonitor }) {
   const conversations = useConversations();
   const [draft, setDraft] = useState("");
   const [railOpen, setRailOpen] = useState(false);
+  const handleTranscriptReady = useCallback((spoken: string) => {
+    setDraft((current) => mergeVoiceTranscript(current, spoken));
+  }, []);
+  const microphone = useMicCapture({ onTranscriptReady: handleTranscriptReady });
 
   const tokenConfigured =
     monitor.status?.ok === true ? monitor.status.data.tokenConfigured : null;
@@ -167,6 +173,17 @@ export function ChatView({ monitor }: { monitor: BackendMonitor }) {
             disabled={authMissing}
             disabledReason="Configure JARVIS_API_TOKEN to enable chat."
             maxLength={CHAT_MESSAGE_MAX_LENGTH}
+            voice={{
+              state: microphone.state,
+              partial: microphone.partial,
+              transcript: microphone.transcript,
+              failure: microphone.failure,
+              preparing: microphone.preparing,
+              onStart: microphone.start,
+              onPrepareModels: microphone.prepareModels,
+              onStop: microphone.stop,
+              onCancel: microphone.cancel,
+            }}
           />
         </div>
       </section>

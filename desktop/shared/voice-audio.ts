@@ -71,7 +71,7 @@ function windowedSinc(x: number, gain: number): number {
   const window =
     ax >= SINC_HALF_TAPS
       ? 0
-      : 0.42 -
+      : 0.42 +
         0.5 * Math.cos((Math.PI * x) / SINC_HALF_TAPS) +
         0.08 * Math.cos((2 * Math.PI * x) / SINC_HALF_TAPS);
   return gain * sinc * window;
@@ -208,19 +208,26 @@ export class StreamingPcmResampler {
  * values are clamped, never wrapped.
  */
 export function float32ToPcm16Bytes(samples: Float32Array): ArrayBuffer {
-  const out = new Int16Array(samples.length);
+  const out = new ArrayBuffer(samples.length * Int16Array.BYTES_PER_ELEMENT);
+  const view = new DataView(out);
   for (let i = 0; i < samples.length; i += 1) {
     const clamped = Math.max(-1, Math.min(1, samples[i]));
-    out[i] = Math.round(clamped * 32_767);
+    const scale = clamped < 0 ? 32_768 : 32_767;
+    view.setInt16(i * Int16Array.BYTES_PER_ELEMENT, Math.round(clamped * scale), true);
   }
-  return out.buffer as ArrayBuffer;
+  return out;
 }
 
 /** Decode bounded little-endian PCM16 bytes back to float32 (-1…+1). */
 export function pcm16BytesToFloat32(buffer: ArrayBuffer): Float32Array {
-  const view = new Int16Array(buffer);
-  const out = new Float32Array(view.length);
-  for (let i = 0; i < view.length; i += 1) out[i] = view[i] / 32_768;
+  if (buffer.byteLength % Int16Array.BYTES_PER_ELEMENT !== 0) {
+    throw new Error("PCM16 buffer must contain an even number of bytes.");
+  }
+  const view = new DataView(buffer);
+  const out = new Float32Array(buffer.byteLength / Int16Array.BYTES_PER_ELEMENT);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = view.getInt16(i * Int16Array.BYTES_PER_ELEMENT, true) / 32_768;
+  }
   return out;
 }
 
@@ -253,9 +260,7 @@ export class Pcm16Chunker {
     let offset = 0;
     while (offset + this.chunkSamples <= combined.length) {
       chunks.push(
-        new Int16Array(
-          combined.slice(offset, offset + this.chunkSamples),
-        ).buffer as ArrayBuffer,
+        int16ToLittleEndianBytes(combined, offset, this.chunkSamples),
       );
       offset += this.chunkSamples;
     }
@@ -270,7 +275,7 @@ export class Pcm16Chunker {
       return [];
     }
     this.drained = true;
-    const out = [new Int16Array(this.carry).buffer as ArrayBuffer];
+    const out = [int16ToLittleEndianBytes(this.carry, 0, this.carry.length)];
     this.carry = new Int16Array(0);
     return out;
   }
@@ -283,4 +288,17 @@ function concatInt16(a: Int16Array, b: Int16Array): Int16Array {
   out.set(a, 0);
   out.set(b, a.length);
   return out;
+}
+
+function int16ToLittleEndianBytes(
+  samples: Int16Array,
+  offset: number,
+  length: number,
+): ArrayBuffer {
+  const bytes = new ArrayBuffer(length * Int16Array.BYTES_PER_ELEMENT);
+  const view = new DataView(bytes);
+  for (let i = 0; i < length; i += 1) {
+    view.setInt16(i * Int16Array.BYTES_PER_ELEMENT, samples[offset + i], true);
+  }
+  return bytes;
 }

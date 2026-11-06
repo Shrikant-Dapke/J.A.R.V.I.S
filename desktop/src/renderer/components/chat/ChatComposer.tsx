@@ -11,7 +11,55 @@
 
 import { useEffect, useRef, type KeyboardEvent } from "react";
 import { cn } from "../../lib/cn";
-import { SendIcon } from "../icons";
+import type { MicCaptureState, MicFailure } from "../../hooks/useMicCapture";
+import { MicIcon, SendIcon } from "../icons";
+
+type VoiceComposerState = {
+  state: MicCaptureState;
+  partial: string;
+  transcript: string;
+  failure: MicFailure | null;
+  preparing: boolean;
+  onStart: () => void;
+  onPrepareModels: () => void;
+  onStop: () => void;
+  onCancel: () => void;
+};
+
+function voiceStateLabel(state: MicCaptureState, failure: MicFailure | null): string {
+  if (state === "failed" && failure) {
+    switch (failure.kind) {
+      case "MICROPHONE_DENIED":
+        return "Microphone denied";
+      case "DEVICE_UNAVAILABLE":
+        return "Device unavailable";
+      case "ENGINE_UNAVAILABLE":
+        return "Voice engine unavailable";
+      case "MODEL_MISSING":
+        return "Voice models unavailable";
+      case "STT_FAILURE":
+        return "Recognition failed";
+      default:
+        return "Microphone failed";
+    }
+  }
+  switch (state) {
+    case "requesting_permission":
+      return "Requesting microphone permission";
+    case "listening":
+      return "Listening";
+    case "transcribing":
+      return "Transcribing";
+    case "transcript_ready":
+      return "Transcript ready — review before sending";
+    case "cancelled":
+      return "Cancelled — nothing was sent";
+    case "failed":
+      return "Microphone failed";
+    default:
+      return "Microphone ready";
+  }
+}
 
 export function ChatComposer({
   draft,
@@ -21,6 +69,7 @@ export function ChatComposer({
   disabled,
   disabledReason,
   maxLength,
+  voice,
 }: {
   draft: string;
   onDraftChange: (next: string) => void;
@@ -31,6 +80,7 @@ export function ChatComposer({
   disabled: boolean;
   disabledReason: string;
   maxLength: number;
+  voice?: VoiceComposerState;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -69,6 +119,10 @@ export function ChatComposer({
       : trimmed.length === 0
         ? "Type a message first."
         : undefined;
+  const voiceActive =
+    voice?.state === "requesting_permission" ||
+    voice?.state === "listening" ||
+    voice?.state === "transcribing";
 
   return (
     <div
@@ -91,7 +145,84 @@ export function ChatComposer({
           "block w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[13.5px] leading-relaxed text-slate-100",
           "placeholder:text-slate-500 focus:outline-none",
         )}
-      />
+        />
+      {voice ? (
+        <div
+          className="border-t border-line/60 px-3 py-2"
+          role="status"
+          aria-live="polite"
+          aria-label="Microphone status"
+        >
+          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            {voiceActive ? (
+              <span aria-hidden className="h-2 w-2 animate-pulse rounded-full bg-danger shadow-[0_0_10px_rgba(248,113,113,0.8)]" />
+            ) : null}
+            <span
+              className={cn(
+                "font-mono uppercase tracking-[0.12em]",
+                voice.state === "failed" ? "text-danger" : voiceActive ? "text-accent-soft" : "text-slate-400",
+              )}
+            >
+              {voiceStateLabel(voice.state, voice.failure)}
+            </span>
+            {voice.state === "listening" ? (
+              <span className="text-slate-500">Audio stays local until recognition completes.</span>
+            ) : null}
+          </div>
+          {voice.partial ? (
+            <p className="mt-1 truncate text-[12px] italic text-slate-400">{voice.partial}</p>
+          ) : null}
+          {voice.state === "transcript_ready" && voice.transcript ? (
+            <p className="mt-1 line-clamp-2 text-[12px] text-slate-300">{voice.transcript}</p>
+          ) : null}
+          {voice.failure ? (
+            <p className="mt-1 text-[12px] leading-relaxed text-danger">{voice.failure.message}</p>
+          ) : null}
+          {voice.failure?.kind === "MODEL_MISSING" ? (
+            <button
+              type="button"
+              onClick={voice.onPrepareModels}
+              disabled={voice.preparing}
+              className="mt-2 focus-ring rounded-lg border border-warn/45 bg-warn/10 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-warn transition-colors hover:bg-warn/20 disabled:cursor-wait disabled:opacity-60"
+            >
+              {voice.preparing ? "Preparing voice models…" : "Prepare voice models"}
+            </button>
+          ) : null}
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {!voiceActive ? (
+              <button
+                type="button"
+                onClick={voice.onStart}
+                className="focus-ring inline-flex items-center gap-1.5 rounded-lg border border-accent/45 bg-accent/10 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-accent-soft transition-colors hover:bg-accent/20"
+                aria-label="Start microphone capture"
+              >
+                <MicIcon className="h-3.5 w-3.5" />
+                {voice.state === "failed" || voice.state === "cancelled" ? "Try microphone again" : "Start microphone"}
+              </button>
+            ) : null}
+            {voice.state === "listening" ? (
+              <button
+                type="button"
+                onClick={voice.onStop}
+                className="focus-ring inline-flex items-center rounded-lg border border-warn/45 bg-warn/10 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-warn transition-colors hover:bg-warn/20"
+                aria-label="Stop microphone capture"
+              >
+                Stop and transcribe
+              </button>
+            ) : null}
+            {voiceActive ? (
+              <button
+                type="button"
+                onClick={voice.onCancel}
+                className="focus-ring inline-flex items-center rounded-lg border border-line px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400 transition-colors hover:border-danger/40 hover:text-danger"
+                aria-label="Cancel microphone capture"
+              >
+                Cancel
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
       <div className="flex items-center justify-between gap-3 border-t border-line/60 px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span
