@@ -10,7 +10,7 @@
  *    performs no network I/O — see shared/ipc-contract.ts).
  */
 
-import { app, BrowserWindow, Menu, dialog } from "electron";
+import { app, BrowserWindow, Menu, dialog, type WebContents } from "electron";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { loadDesktopConfig, type DesktopConfig } from "./config";
@@ -25,6 +25,7 @@ import {
   createWindowOptions,
   shouldAllowNavigation,
   denyOpenWindow,
+  isMicPermissionAllowed,
 } from "./app-security";
 import type { BackendStatus } from "../../shared/ipc-contract";
 import { VOICE_EVENTS_CHANNEL } from "../../shared/ipc-contract";
@@ -130,6 +131,15 @@ function createMainWindow(): BrowserWindow {
   return window;
 }
 
+function getWebContentsUrl(contents: WebContents | null): string | null {
+  if (!contents) return null;
+  try {
+    return contents.getURL() || null;
+  } catch {
+    return null;
+  }
+}
+
 /** Process-wide hardening for every webContents this app ever creates. */
 function attachSecurityGuards(): void {
   app.on("web-contents-created", (_event, contents) => {
@@ -149,8 +159,43 @@ function attachSecurityGuards(): void {
       }
     });
     contents.setWindowOpenHandler(() => denyOpenWindow());
-    contents.session.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
-    contents.session.setPermissionCheckHandler(() => false);
+    contents.session.setPermissionRequestHandler((requestingContents, permission, callback, details) => {
+      const trust = runtime?.navigationTrust ?? { devServerUrl: null, isDistHosting: true };
+      const frameUrl = getWebContentsUrl(requestingContents);
+      const requestDetails = details as {
+        requestingUrl?: string;
+        isMainFrame?: boolean;
+        mediaTypes?: readonly string[];
+      };
+      callback(
+        isMicPermissionAllowed(
+          permission,
+          requestDetails.requestingUrl ?? frameUrl,
+          trust,
+          {
+            isMainFrame: requestDetails.isMainFrame,
+            frameUrl,
+            mediaTypes: requestDetails.mediaTypes,
+          },
+        ),
+      );
+    });
+    contents.session.setPermissionCheckHandler(
+      (requestingContents, permission, requestingOrigin, details) => {
+        const trust = runtime?.navigationTrust ?? { devServerUrl: null, isDistHosting: true };
+        const frameUrl = getWebContentsUrl(requestingContents);
+        return isMicPermissionAllowed(
+          permission,
+          details.requestingUrl ?? frameUrl ?? requestingOrigin,
+          trust,
+          {
+            isMainFrame: details.isMainFrame,
+            frameUrl,
+            mediaType: details.mediaType,
+          },
+        );
+      },
+    );
   });
 }
 
