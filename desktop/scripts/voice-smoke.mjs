@@ -372,9 +372,10 @@ async function runSmoke(downloadOnly) {
   say("TTS — Kokoro-82M int8");
   say(hr);
   const ttsText = "The bridge is down. Standing by for your next instruction.";
+  const ttsRequestId = 1;
   const speakStarted = performance.now();
   const countBefore = worker.events.length;
-  worker.send({ type: "tts-speak", text: ttsText, sid: 0, speed: 1 });
+  worker.send({ type: "tts-speak", text: ttsText, sid: 0, speed: 1, requestId: ttsRequestId });
   await worker.waitFor((m) => m.type === "tts-chunk" || m.type === "worker-error", 30_000, countBefore);
   const eventsSoFar = worker.events.slice(countBefore);
   const firstErrorEarly = eventsSoFar.find((m) => m.type === "worker-error");
@@ -391,6 +392,7 @@ async function runSmoke(downloadOnly) {
   const synthMs = performance.now() - speakStarted;
   const audioSeconds = ended.totalSamples / ended.sampleRate;
   const tts = {
+    requestId: ended.requestId,
     sampleRate: ended.sampleRate,
     totalSamples: ended.totalSamples,
     audioSeconds,
@@ -399,6 +401,8 @@ async function runSmoke(downloadOnly) {
     synthMs,
     rtf: synthMs / 1000 / audioSeconds,
   };
+  if (ended.requestId !== ttsRequestId) throw new Error("tts-ended request identity mismatch.");
+  if (firstChunk.requestId !== ttsRequestId) throw new Error("tts-chunk request identity mismatch.");
   say(`  ✓ ${ended.totalSamples} samples @ ${ended.sampleRate} Hz → ${audioSeconds.toFixed(2)} s audio`);
   say(`  ✓ first audio in ${firstAudioMs.toFixed(0)} ms; total wall ${synthMs.toFixed(0)} ms → RTF ${tts.rtf.toFixed(3)}`);
   say(`  ✓ ${chunkCount} chunk(s); model-reported rate rides every chunk (${firstChunk.sampleRate} Hz)`);

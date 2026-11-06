@@ -26,6 +26,8 @@ import {
 const nativeControl = {
   recognizerShouldThrow: false,
   recognizerTranscript: "the quarterly report is ready",
+  ttsShouldThrow: false,
+  ttsGenerateShouldThrow: false,
   /** Total synthesized samples per utterance. */
   ttsTotalSamples: 80_000,
   /** How many incremental onProgress pieces tile that total. */
@@ -75,6 +77,9 @@ const fakeTtsInstance = {
     text: string;
     onProgress?: (info: { samples: Float32Array; progress: number }) => number;
   }) => {
+    if (nativeControl.ttsGenerateShouldThrow) {
+      throw new Error("fake Kokoro synthesis failure");
+    }
     nativeControl.lastText = request.text;
     // Native behavior mirrored EXACTLY: onProgress delivers incremental
     // pieces; the returned audio is the whole utterance (a naive worker
@@ -101,6 +106,9 @@ const fakeNativeModule = {
   OfflineTts: {
     createAsync: async () => {
       nativeControl.loadCount += 1;
+      if (nativeControl.ttsShouldThrow) {
+        throw new Error("fake Kokoro initialization failure");
+      }
       return fakeTtsInstance;
     },
   },
@@ -110,7 +118,7 @@ const fakeNativeModule = {
 /* Harness: real worker + real engine over an in-memory transport         */
 /* ---------------------------------------------------------------------- */
 
-function createHarness(): { engine: ReturnType<typeof createVoiceEngine>; events: VoiceEventPayload[]; spawnCount: () => number } {
+function createHarness(options: { ttsPresent?: boolean } = {}): { engine: ReturnType<typeof createVoiceEngine>; events: VoiceEventPayload[]; spawnCount: () => number } {
   const events: VoiceEventPayload[] = [];
   let spawned = 0;
 
@@ -182,16 +190,17 @@ function createHarness(): { engine: ReturnType<typeof createVoiceEngine>; events
   // order must be sorted, exactly like the real model manager produces.
   const sttPaths = { decoder: "d.onnx", encoder: "e.onnx", joiner: "j.onnx", tokens: "t.txt" };
   const ttsPaths = { dataDir: "d", lexicon: "l", model: "m.onnx", tokens: "t.txt", voices: "v.bin" };
+  const ttsPresent = options.ttsPresent ?? true;
   const models: VoiceModelManager = {
     baseDir: "C:\\fake\\models",
     smokePaths: () => ({ wavsDir: null, transTxt: null, missingAssets: [] }),
     status: () => ({
       sttPresent: true,
-      ttsPresent: true,
+      ttsPresent,
       sttMissing: [],
       ttsMissing: [],
       sttPaths,
-      ttsPaths,
+      ttsPaths: ttsPresent ? ttsPaths : null,
     }),
     prepareModels: async () => ({ ok: true, downloaded: 0, verifiedFromCache: 0, bytes: 0 }),
     verify: async () => ({ ok: true, checked: 1 }),
@@ -318,13 +327,13 @@ test("worker crash during listening fails the session; next arm respawns it", as
   assert.equal((await engine.end()).ok, true);
 });
 
-test("compression honesty: PCM16 chunks are bounded, ordered, rate-tagged, and NOT double-counted", async () => {
+test("compression honesty: PCM16 chunks are bounded, ordered, identified, rate-tagged, and NOT double-counted", async () => {
   nativeControl.ttsTotalSamples = 80_000; // exercises worker-side >32k slicing
   nativeControl.ttsPieceCount = 1;
   nativeControl.ttsSampleRate = 24_000;
   const { engine, events } = createHarness();
 
-  const outcome = await engine.speak("All systems nominal.");
+  const outcome = await engine.speak("All systems nominal.", 0, 1, 42);
   assert.equal(outcome.ok, true, JSON.stringify(outcome));
   assert.equal(engine.state(), "idle");
 
@@ -335,12 +344,20 @@ test("compression honesty: PCM16 chunks are bounded, ordered, rate-tagged, and N
   let totalSamples = 0;
   for (const [index, chunk] of chunks.entries()) {
     assert.equal(chunk.sequence, index, "sequence is dense and ordered");
+    assert.equal(chunk.requestId, 42, "request identity rides every chunk");
     assert.equal(chunk.sampleRate, 24_000, "the MODEL-reported rate rides every chunk");
+    assert.equal(chunk.channels, 1);
+    assert.equal(chunk.encoding, "pcm16le");
     assert.ok(chunk.pcm.byteLength <= 65_536, "renderer bound respected");
     totalSamples += chunk.pcm.byteLength / 2;
   }
   assert.equal(totalSamples, 80_000, "progress pieces feed everything — the whole-utterance audio object is NOT re-emitted");
-  assert.ok(events.some((event) => event.kind === "tts-ended"));
+  const ended = events.find((event): event is Extract<VoiceEventPayload, { kind: "tts-ended" }> => event.kind === "tts-ended");
+  assert.equal(ended?.requestId, 42);
+  assert.equal(ended?.totalSamples, 80_000);
+  assert.equal(ended?.sampleRate, 24_000);
+  assert.equal(ended?.channels, 1);
+  assert.equal(ended?.encoding, "pcm16le");
 
   // bytes all even (PCM16): spot-check the final tail size.
   assert.equal(chunks[2].pcm.byteLength, 14_464 * 2);
@@ -365,6 +382,40 @@ test("speech is refused outside its legal states with VOICE_STATE", async () => 
   const outcome = await engine.speak("no");
   assert.equal(outcome.ok, false);
   if (!outcome.ok) assert.equal(outcome.code, "VOICE_STATE");
+});
+
+test("TTS initialization failure is honest and does not fabricate audio", async () => {
+  nativeControl.ttsShouldThrow = true;
+  const { engine, events } = createHarness();
+  const outcome = await engine.speak("initialization failure", 0, 1, 101);
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) assert.equal(outcome.code, "TTS_FAILURE");
+  assert.equal(engine.state(), "failed");
+  assert.equal(events.some((event) => event.kind === "tts-chunk"), false);
+  nativeControl.ttsShouldThrow = false;
+});
+
+test("missing TTS model files fail honestly before native synthesis", async () => {
+  const { engine, events } = createHarness({ ttsPresent: false });
+  const outcome = await engine.speak("model missing", 0, 1, 100);
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) assert.equal(outcome.code, "MODEL_MISSING");
+  assert.equal(engine.state(), "failed");
+  assert.equal(events.some((event) => event.kind === "tts-chunk"), false);
+});
+
+test("TTS synthesis failure is propagated without a success event", async () => {
+  nativeControl.ttsGenerateShouldThrow = true;
+  const { engine, events } = createHarness();
+  const outcome = await engine.speak("synthesis failure", 0, 1, 102);
+  assert.equal(outcome.ok, false);
+  if (!outcome.ok) assert.equal(outcome.code, "TTS_FAILURE");
+  assert.equal(engine.state(), "failed");
+  assert.equal(
+    events.some((event) => event.kind === "tts-ended" && event.requestId === 102),
+    false,
+  );
+  nativeControl.ttsGenerateShouldThrow = false;
 });
 
 test("feed refuses oversized PCM without killing the session", async () => {

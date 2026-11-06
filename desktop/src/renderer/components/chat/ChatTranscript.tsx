@@ -14,8 +14,9 @@ import {
 import { cn } from "../../lib/cn";
 import { Badge, ErrorNote } from "../primitives";
 import { Button } from "../controls";
-import { RefreshIcon } from "../icons";
+import { RefreshIcon, SpeakerIcon, StopIcon } from "../icons";
 import { failureDetail, failureHeadline } from "./failures";
+import type { VoicePlaybackView } from "../../hooks/useVoicePlayback";
 
 const WELCOME_EXAMPLES = [
   "What is my system information?",
@@ -175,16 +176,89 @@ function PlanProposalCard({ message }: { message: ChatMessage }) {
   );
 }
 
-function AssistantBubble({ message }: { message: ChatMessage }) {
+function playbackLabel(state: VoicePlaybackView["state"]): string {
+  switch (state) {
+    case "preparing":
+      return "Preparing voice model";
+    case "synthesizing":
+      return "Synthesizing locally";
+    case "playing":
+      return "JARVIS is speaking";
+    case "completed":
+      return "Playback completed";
+    case "cancelled":
+      return "Playback cancelled";
+    case "failed":
+      return "Playback failed";
+    default:
+      return "";
+  }
+}
+
+function AssistantBubble({
+  message,
+  playback,
+}: {
+  message: ChatMessage;
+  playback: VoicePlaybackView;
+}) {
+  const current = playback.activeMessageId === message.id;
+  const active =
+    current &&
+    (playback.state === "preparing" ||
+      playback.state === "synthesizing" ||
+      playback.state === "playing");
+  const showStatus = current && playback.state !== "idle";
   return (
     <div className="flex justify-start">
       <div className="max-w-[86%] rounded-2xl border border-line bg-hull/60 px-4 py-2.5">
-        <p className="text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-slate-200">
-          {message.content}
-        </p>
+        <div className="flex items-start gap-3">
+          <p className="min-w-0 flex-1 text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-slate-200">
+            {message.content}
+          </p>
+          <button
+            type="button"
+            onClick={() => (active ? playback.stop() : playback.play(message.id, message.content))}
+            className={cn(
+              "focus-ring mt-0.5 shrink-0 rounded-lg border p-1.5 transition-colors",
+              active
+                ? "border-warn/50 bg-warn/10 text-warn hover:bg-warn/20"
+                : "border-line text-slate-500 hover:border-accent/45 hover:text-accent-soft",
+            )}
+            aria-label={active ? "Stop speaking this response" : "Speak this response"}
+            title={active ? "Stop speaking" : "Speak response"}
+          >
+            {active ? <StopIcon className="h-3.5 w-3.5" /> : <SpeakerIcon className="h-3.5 w-3.5" />}
+          </button>
+        </div>
         {message.proposal ? <ExecutedToolLine message={message} /> : null}
         {message.proposal ? <ActionProposalCard message={message} /> : null}
         {message.proposal ? <PlanProposalCard message={message} /> : null}
+        {showStatus ? (
+          <div className="mt-2 border-t border-line/60 pt-2" role="status" aria-live="polite">
+            <p
+              className={cn(
+                "font-mono text-[10px] uppercase tracking-[0.14em]",
+                active ? "text-accent-soft" : playback.state === "failed" ? "text-danger" : "text-slate-500",
+              )}
+            >
+              {playbackLabel(playback.state)}
+            </p>
+            {playback.failure ? (
+              <p className="mt-1 text-[11px] leading-relaxed text-danger">{playback.failure.message}</p>
+            ) : null}
+            {playback.failure?.code === "MODEL_MISSING" ? (
+              <button
+                type="button"
+                onClick={playback.prepareModels}
+                disabled={playback.preparing}
+                className="focus-ring mt-2 rounded-lg border border-warn/45 bg-warn/10 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.12em] text-warn transition-colors hover:bg-warn/20 disabled:cursor-wait disabled:opacity-60"
+              >
+                {playback.preparing ? "Preparing voice models…" : "Prepare voice models"}
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         <p className="mt-1 font-mono text-[10px] text-slate-500">
           {formatStamp(message.createdAt)}
         </p>
@@ -248,10 +322,12 @@ export function ChatTranscript({
   state,
   onRetryHistory,
   onUseExample,
+  playback,
 }: {
   state: ChatSessionState;
   onRetryHistory: () => void;
   onUseExample: (text: string) => void;
+  playback: VoicePlaybackView;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
@@ -308,7 +384,7 @@ export function ChatTranscript({
           message.role === "user" ? (
             <UserBubble key={message.id} message={message} />
           ) : (
-            <AssistantBubble key={message.id} message={message} />
+            <AssistantBubble key={message.id} message={message} playback={playback} />
           ),
         )}
       </div>

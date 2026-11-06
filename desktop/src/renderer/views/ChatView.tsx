@@ -5,7 +5,7 @@
  * is never lost; sends are serialized and never retried automatically.
  */
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ChatComposer } from "../components/chat/ChatComposer";
 import { ChatTranscript } from "../components/chat/ChatTranscript";
 import { ConversationRail } from "../components/chat/ConversationRail";
@@ -14,6 +14,7 @@ import { Badge } from "../components/primitives";
 import { useChatSession, type SendOutcome } from "../hooks/useChatSession";
 import { useConversations } from "../hooks/useConversations";
 import { useMicCapture } from "../hooks/useMicCapture";
+import { useVoicePlayback } from "../hooks/useVoicePlayback";
 import type { BackendMonitor } from "../hooks/useBackendMonitor";
 import { CHAT_MESSAGE_MAX_LENGTH } from "../../../shared/ipc-contract";
 import { cn } from "../lib/cn";
@@ -52,12 +53,22 @@ export function ChatView({ monitor }: { monitor: BackendMonitor }) {
     setDraft((current) => mergeVoiceTranscript(current, spoken));
   }, []);
   const microphone = useMicCapture({ onTranscriptReady: handleTranscriptReady });
+  const playback = useVoicePlayback();
+  const previousConversationRef = useRef(session.state.conversationId);
+
+  useEffect(() => {
+    if (previousConversationRef.current !== session.state.conversationId) {
+      playback.stop();
+      previousConversationRef.current = session.state.conversationId;
+    }
+  }, [playback, session.state.conversationId]);
 
   const tokenConfigured =
     monitor.status?.ok === true ? monitor.status.data.tokenConfigured : null;
   const authMissing = tokenConfigured === false;
 
   const handleSubmit = (content: string) => {
+    playback.stop();
     void (async () => {
       const outcome: SendOutcome = await session.sendMessage(content);
       if (outcome === "failed") {
@@ -161,6 +172,7 @@ export function ChatView({ monitor }: { monitor: BackendMonitor }) {
             state={session.state}
             onRetryHistory={session.retryHistory}
             onUseExample={(example) => setDraft(example)}
+            playback={playback}
           />
         </div>
 

@@ -17,7 +17,11 @@
 import {
   VOICE_FAILURE_MESSAGE_MAX_LENGTH,
   VOICE_PCM_CHUNK_MAX_BYTES,
+  VOICE_PLAYBACK_REQUEST_ID_MAX,
   VOICE_SEQUENCE_MAX,
+  VOICE_TTS_CHANNELS,
+  VOICE_TTS_ENCODING,
+  VOICE_TTS_MAX_SAMPLES,
   VOICE_TEXT_MAX_LENGTH,
   type PayloadValidation,
 } from "./ipc-contract";
@@ -380,9 +384,24 @@ export type VoiceEventPayload =
   | { kind: "partial"; transcript: string }
   /** Authoritative final transcript (non-empty; bounded). */
   | { kind: "final"; transcript: string }
-  /** One streamed synthesis chunk: raw mono PCM16 + sequence + rate. */
-  | { kind: "tts-chunk"; pcm: ArrayBuffer; sequence: number; sampleRate: number }
-  | { kind: "tts-ended" }
+  /** One bounded synthesis chunk: mono PCM16 LE + identity + rate metadata. */
+  | {
+      kind: "tts-chunk";
+      pcm: ArrayBuffer;
+      requestId: number;
+      sequence: number;
+      sampleRate: number;
+      channels: typeof VOICE_TTS_CHANNELS;
+      encoding: typeof VOICE_TTS_ENCODING;
+    }
+  | {
+      kind: "tts-ended";
+      requestId: number;
+      totalSamples: number;
+      sampleRate: number;
+      channels: typeof VOICE_TTS_CHANNELS;
+      encoding: typeof VOICE_TTS_ENCODING;
+    }
   /** Engine failure (closed code set; bounded message). */
   | { kind: "failure"; code: VoiceErrorCode; message: string };
 
@@ -455,24 +474,34 @@ export function validateVoiceEventPayload(
         : { ok: true, value: { kind: "final", transcript } };
     }
     case "tts-chunk": {
-      // Sorted keys: [kind, pcm, sampleRate, sequence].
+      // Sorted keys: [channels, encoding, kind, pcm, requestId, sampleRate, sequence].
       if (
-        keys.length !== 4 ||
-        keys[0] !== "kind" ||
-        keys[1] !== "pcm" ||
-        keys[2] !== "sampleRate" ||
-        keys[3] !== "sequence"
+        keys.length !== 7 ||
+        keys[0] !== "channels" ||
+        keys[1] !== "encoding" ||
+        keys[2] !== "kind" ||
+        keys[3] !== "pcm" ||
+        keys[4] !== "requestId" ||
+        keys[5] !== "sampleRate" ||
+        keys[6] !== "sequence"
       ) {
         return {
           ok: false,
-          reason: "Voice event 'tts-chunk' accepts exactly pcm, sequence, and sampleRate.",
+          reason:
+            "Voice event 'tts-chunk' accepts exactly pcm, requestId, sequence, sampleRate, channels, and encoding.",
         };
       }
-      const { pcm, sequence, sampleRate } = value as {
+      const { channels, encoding, pcm, requestId, sequence, sampleRate } = value as {
+        channels: unknown;
+        encoding: unknown;
         pcm: unknown;
+        requestId: unknown;
         sequence: unknown;
         sampleRate: unknown;
       };
+      if (channels !== VOICE_TTS_CHANNELS || encoding !== VOICE_TTS_ENCODING) {
+        return { ok: false, reason: "Voice event TTS audio format must be mono PCM16 LE." };
+      }
       if (!(pcm instanceof ArrayBuffer)) {
         return { ok: false, reason: "Voice event PCM chunk must be an ArrayBuffer." };
       }
@@ -482,6 +511,14 @@ export function validateVoiceEventPayload(
           reason:
             `Voice event PCM chunk must carry 1..${VOICE_PCM_CHUNK_MAX_BYTES} bytes.`,
         };
+      }
+      if (
+        typeof requestId !== "number" ||
+        !Number.isInteger(requestId) ||
+        requestId < 0 ||
+        requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+      ) {
+        return { ok: false, reason: "Voice event requestId is out of bounds." };
       }
       if (
         typeof sampleRate !== "number" ||
@@ -502,13 +539,81 @@ export function validateVoiceEventPayload(
           reason: `Voice event sequence must be an integer in 0..${VOICE_SEQUENCE_MAX}.`,
         };
       }
-      return { ok: true, value: { kind: "tts-chunk", pcm, sequence, sampleRate } };
+      return {
+        ok: true,
+        value: {
+          kind: "tts-chunk",
+          pcm,
+          requestId,
+          sequence,
+          sampleRate,
+          channels: VOICE_TTS_CHANNELS,
+          encoding: VOICE_TTS_ENCODING,
+        },
+      };
     }
     case "tts-ended": {
-      if (keys.length !== 1 || keys[0] !== "kind") {
-        return { ok: false, reason: "Voice event 'tts-ended' takes no extra fields." };
+      // Sorted keys: [channels, encoding, kind, requestId, sampleRate, totalSamples].
+      if (
+        keys.length !== 6 ||
+        keys[0] !== "channels" ||
+        keys[1] !== "encoding" ||
+        keys[2] !== "kind" ||
+        keys[3] !== "requestId" ||
+        keys[4] !== "sampleRate" ||
+        keys[5] !== "totalSamples"
+      ) {
+        return {
+          ok: false,
+          reason:
+            "Voice event 'tts-ended' accepts exactly requestId, totalSamples, sampleRate, channels, and encoding.",
+        };
       }
-      return { ok: true, value: { kind: "tts-ended" } };
+      const { channels, encoding, requestId, sampleRate, totalSamples } = value as {
+        channels: unknown;
+        encoding: unknown;
+        requestId: unknown;
+        sampleRate: unknown;
+        totalSamples: unknown;
+      };
+      if (channels !== VOICE_TTS_CHANNELS || encoding !== VOICE_TTS_ENCODING) {
+        return { ok: false, reason: "Voice event TTS audio format must be mono PCM16 LE." };
+      }
+      if (
+        typeof requestId !== "number" ||
+        !Number.isInteger(requestId) ||
+        requestId < 0 ||
+        requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+      ) {
+        return { ok: false, reason: "Voice event requestId is out of bounds." };
+      }
+      if (
+        typeof totalSamples !== "number" ||
+        !Number.isInteger(totalSamples) ||
+        totalSamples <= 0 ||
+        totalSamples > VOICE_TTS_MAX_SAMPLES
+      ) {
+        return { ok: false, reason: "Voice event totalSamples is out of bounds." };
+      }
+      if (
+        typeof sampleRate !== "number" ||
+        !Number.isInteger(sampleRate) ||
+        sampleRate < 8000 ||
+        sampleRate > 96_000
+      ) {
+        return { ok: false, reason: "Voice event sample rate is out of bounds." };
+      }
+      return {
+        ok: true,
+        value: {
+          kind: "tts-ended",
+          requestId,
+          totalSamples,
+          sampleRate,
+          channels: VOICE_TTS_CHANNELS,
+          encoding: VOICE_TTS_ENCODING,
+        },
+      };
     }
     case "failure": {
       // Sorted keys: [code, kind, message].

@@ -32,6 +32,7 @@ import {
   type PlanStepRequestOutcomeView,
   type SystemInfoSummary,
   type ToolExecutionView,
+  type TtsSpeakPayload,
   type VoiceFeedPayload,
   type VoiceStatusView,
 } from "../../../shared/ipc-contract";
@@ -212,6 +213,14 @@ export async function prepareVoiceModels(): Promise<IpcResult<VoiceStatusView>> 
     BRIDGE_CONTEXT,
     await resolveBridge().voicePrepareModels(),
   );
+}
+
+export async function ttsSpeak(payload: TtsSpeakPayload): Promise<IpcResult<EmptyPayload>> {
+  return asIpcResult<EmptyPayload>(BRIDGE_CONTEXT, await resolveBridge().ttsSpeak(payload));
+}
+
+export async function ttsStop(): Promise<IpcResult<EmptyPayload>> {
+  return asIpcResult<EmptyPayload>(BRIDGE_CONTEXT, await resolveBridge().ttsStop());
 }
 
 export function subscribeVoiceEvents(

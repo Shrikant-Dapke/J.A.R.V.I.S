@@ -332,10 +332,43 @@ test("every documented event kind validates and round-trips", () => {
     { input: { kind: "partial", transcript: "" }, expected: { kind: "partial", transcript: "" } },
     { input: { kind: "final", transcript: "hello" }, expected: { kind: "final", transcript: "hello" } },
     {
-      input: { kind: "tts-chunk", pcm: new ArrayBuffer(4), sequence: 0, sampleRate: 24_000 },
-      expected: { kind: "tts-chunk", pcm: new ArrayBuffer(4), sequence: 0, sampleRate: 24_000 },
+      input: {
+        kind: "tts-chunk",
+        pcm: new ArrayBuffer(4),
+        requestId: 7,
+        sequence: 0,
+        sampleRate: 24_000,
+        channels: 1,
+        encoding: "pcm16le",
+      },
+      expected: {
+        kind: "tts-chunk",
+        pcm: new ArrayBuffer(4),
+        requestId: 7,
+        sequence: 0,
+        sampleRate: 24_000,
+        channels: 1,
+        encoding: "pcm16le",
+      },
     },
-    { input: { kind: "tts-ended" }, expected: { kind: "tts-ended" } },
+    {
+      input: {
+        kind: "tts-ended",
+        requestId: 7,
+        totalSamples: 2,
+        sampleRate: 24_000,
+        channels: 1,
+        encoding: "pcm16le",
+      },
+      expected: {
+        kind: "tts-ended",
+        requestId: 7,
+        totalSamples: 2,
+        sampleRate: 24_000,
+        channels: 1,
+        encoding: "pcm16le",
+      },
+    },
     {
       input: { kind: "failure", code: "MODEL_MISSING", message: "no model" },
       expected: { kind: "failure", code: "MODEL_MISSING", message: "no model" },
@@ -358,13 +391,13 @@ test("event shapes reject unknown kinds and extra keys", () => {
     {},
     { kind: 42 },
     { kind: "ghost" },
-    { kind: "tts-ended", ridealong: true },
+    { kind: "tts-ended", requestId: 7, totalSamples: 2, sampleRate: 24_000, channels: 1, encoding: "pcm16le", ridealong: true },
     { kind: "state", state: "listening", spam: 1 },
     { kind: "partial", transcript: "ok", spam: 1 },
     { kind: "state" }, // missing state
     { kind: "partial" }, // missing transcript
-    { kind: "tts-chunk", pcm: new ArrayBuffer(2) }, // missing sequence/rate
-    { kind: "tts-chunk", pcm: new ArrayBuffer(2), sequence: 1 }, // missing sampleRate
+    { kind: "tts-chunk", pcm: new ArrayBuffer(2) }, // missing metadata
+    { kind: "tts-chunk", pcm: new ArrayBuffer(2), requestId: 7, sequence: 1 }, // missing format/rate
     { kind: "failure", code: "STT_FAILURE" }, // missing message
   ]) {
     assert.equal(validateVoiceEventPayload(bad).ok, false, JSON.stringify(bad));
@@ -392,7 +425,15 @@ test("event value bounds: transcript length, PCM bytes, sequence range", () => {
 
   // PCM bounds (sample rate is carried on EVERY chunk now — model-reported).
   const chunk = (pcm: unknown, sequence: unknown, sampleRate: unknown = 24_000) =>
-    validateVoiceEventPayload({ kind: "tts-chunk", pcm, sequence, sampleRate });
+    validateVoiceEventPayload({
+      kind: "tts-chunk",
+      pcm,
+      requestId: 7,
+      sequence,
+      sampleRate,
+      channels: 1,
+      encoding: "pcm16le",
+    });
   assert.equal(chunk(new ArrayBuffer(1), 3).ok, true, "1 byte is a legal chunk");
   assert.equal(
     chunk(new ArrayBuffer(VOICE_PCM_CHUNK_MAX_BYTES), 3).ok,
@@ -413,7 +454,14 @@ test("event value bounds: transcript length, PCM bytes, sequence range", () => {
   assert.equal(chunk(new ArrayBuffer(2), 0, 96_000).ok, true, "96 kHz lattice ceiling");
   // A chunk missing the rate key entirely is refused.
   assert.equal(
-    validateVoiceEventPayload({ kind: "tts-chunk", pcm: new ArrayBuffer(2), sequence: 0 }).ok,
+    validateVoiceEventPayload({
+      kind: "tts-chunk",
+      pcm: new ArrayBuffer(2),
+      requestId: 7,
+      sequence: 0,
+      channels: 1,
+      encoding: "pcm16le",
+    }).ok,
     false,
     "sampleRate is mandatory",
   );

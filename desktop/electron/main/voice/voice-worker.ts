@@ -18,6 +18,7 @@
  */
 
 import type { VoiceErrorCode } from "../../../shared/voice-engine";
+import { VOICE_TTS_MAX_SAMPLES } from "../../../shared/ipc-contract";
 import {
   validateWorkerRequest,
   validateWorkerResponse,
@@ -173,12 +174,18 @@ export function startVoiceWorker(host: WorkerHost, nativeModule?: unknown): Star
     draining = false;
   };
 
-  const pushFailure = (code: VoiceErrorCode, scope: "stt" | "tts" | "engine", message: string): void => {
+  const pushFailure = (
+    code: VoiceErrorCode,
+    scope: "stt" | "tts" | "engine",
+    message: string,
+    requestId?: number,
+  ): void => {
     emit({
       type: "worker-error",
       scope,
       message: clampMessage(message),
       ...(code !== "ENGINE_UNAVAILABLE" ? { code } : {}),
+      ...(requestId !== undefined ? { requestId } : {}),
     });
   };
 
@@ -282,31 +289,43 @@ export function startVoiceWorker(host: WorkerHost, nativeModule?: unknown): Star
         if (!tts) {
           await ttsSettled;
           if (tts === null) {
-            pushFailure("MODEL_MISSING", "engine", "Speech synthesis is not initialized.");
+            pushFailure("MODEL_MISSING", "engine", "Speech synthesis is not initialized.", request.requestId);
             return;
           }
         }
         const engine = tts;
         if (!engine) {
-          pushFailure("TTS_FAILURE", "tts", "Speech synthesis is not available.");
+          pushFailure("TTS_FAILURE", "tts", "Speech synthesis is not available.", request.requestId);
           return;
         }
         synthesizeAbort = false;
         synthesisInFlight = true;
         let sequence = 0;
         let totalSamples = 0;
+        let outputLimitExceeded = false;
         try {
           // onProgress receives INCREMENTAL synthesis pieces; the final
           // `audio.samples` is the WHOLE utterance. The emitted stream is
           // therefore fed exclusively by onProgress — the audio object is
           // a fallback for runtimes that give no progress callbacks.
-          const chunker = (samples: Float32Array, sampleRate: number): void => {
+          const chunker = (samples: Float32Array, sampleRate: number): boolean => {
+            if (totalSamples + samples.length > VOICE_TTS_MAX_SAMPLES) {
+              outputLimitExceeded = true;
+              return false;
+            }
             for (let offset = 0; offset < samples.length; offset += VOICE_PROTOCOL_TTS_CHUNK_SAMPLES) {
               const chunk = samples.slice(offset, offset + VOICE_PROTOCOL_TTS_CHUNK_SAMPLES);
-              emit({ type: "tts-chunk", sequence, samples: chunk, sampleRate });
+              emit({
+                type: "tts-chunk",
+                requestId: request.requestId,
+                sequence,
+                samples: chunk,
+                sampleRate,
+              });
               sequence += 1;
               totalSamples += chunk.length;
             }
+            return true;
           };
           const audio = await engine.generateAsync({
             text: request.text,
@@ -314,23 +333,38 @@ export function startVoiceWorker(host: WorkerHost, nativeModule?: unknown): Star
             speed: request.speed,
             onProgress: (info) => {
               if (synthesizeAbort) return 0; // sherpa stops generation on 0
-              chunker(info.samples, engine.sampleRate);
-              return 1;
+              return chunker(info.samples, engine.sampleRate) ? 1 : 0;
             },
           });
           if (totalSamples === 0 && audio.samples.length > 0) {
             chunker(audio.samples, audio.sampleRate);
           }
+          if (outputLimitExceeded) {
+            synthesisInFlight = false;
+            pushFailure(
+              "TTS_FAILURE",
+              "tts",
+              "Speech output exceeded the bounded playback limit.",
+              request.requestId,
+            );
+            return;
+          }
           synthesisInFlight = false;
           emit({
             type: "tts-ended",
+            requestId: request.requestId,
             totalSamples,
             sampleRate: totalSamples > 0 ? engine.sampleRate : audio.sampleRate,
             aborted: synthesizeAbort,
           });
         } catch (error) {
           synthesisInFlight = false;
-          pushFailure("TTS_FAILURE", "tts", error instanceof Error ? error.message : String(error));
+          pushFailure(
+            "TTS_FAILURE",
+            "tts",
+            error instanceof Error ? error.message : String(error),
+            request.requestId,
+          );
         }
         return;
       }

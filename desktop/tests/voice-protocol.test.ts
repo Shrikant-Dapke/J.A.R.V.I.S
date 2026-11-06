@@ -55,24 +55,26 @@ test("stt-feed demands a bounded Float32Array and exactly the samples key", () =
 
 test("tts-speak bounds: text, voice id, and speed lattice", () => {
   assert.equal(
-    validateWorkerRequest({ type: "tts-speak", text: "hello", sid: 0, speed: 1 }).ok,
+    validateWorkerRequest({ type: "tts-speak", text: "hello", sid: 0, speed: 1, requestId: 7 }).ok,
     true,
   );
   for (const bad of [
     { type: "tts-speak", text: "   " },
-    { type: "tts-speak", text: "", sid: 0, speed: 1 },
-    { type: "tts-speak", text: "ok", sid: -1, speed: 1 },
-    { type: "tts-speak", text: "ok", sid: 1.5, speed: 1 },
-    { type: "tts-speak", text: "ok", sid: 0, speed: 0.4 },
-    { type: "tts-speak", text: "ok", sid: 0, speed: 3.1 },
-    { type: "tts-speak", text: "ok", sid: 0, speed: NaN },
-    { type: "tts-speak", text: "ok", sid: 0 },
-    { type: "tts-speak", text: "ok", sid: 0, speed: 1, rogue: 1 },
+    { type: "tts-speak", text: "", sid: 0, speed: 1, requestId: 7 },
+    { type: "tts-speak", text: "ok", sid: -1, speed: 1, requestId: 7 },
+    { type: "tts-speak", text: "ok", sid: 1.5, speed: 1, requestId: 7 },
+    { type: "tts-speak", text: "ok", sid: 0, speed: 0.4, requestId: 7 },
+    { type: "tts-speak", text: "ok", sid: 0, speed: 3.1, requestId: 7 },
+    { type: "tts-speak", text: "ok", sid: 0, speed: NaN, requestId: 7 },
+    { type: "tts-speak", text: "ok", sid: 0, speed: 1 },
+    { type: "tts-speak", text: "ok", sid: 0, speed: 1, requestId: -1 },
+    { type: "tts-speak", text: "ok", sid: 0, speed: 1, requestId: 1.5 },
+    { type: "tts-speak", text: "ok", sid: 0, speed: 1, requestId: 7, rogue: 1 },
   ]) {
     assert.equal(validateWorkerRequest(bad).ok, false, JSON.stringify(bad));
   }
-  const fast = validateWorkerRequest({ type: "tts-speak", text: "ok", sid: 0, speed: 3 });
-  const slow = validateWorkerRequest({ type: "tts-speak", text: "ok", sid: 0, speed: 0.5 });
+  const fast = validateWorkerRequest({ type: "tts-speak", text: "ok", sid: 0, speed: 3, requestId: 7 });
+  const slow = validateWorkerRequest({ type: "tts-speak", text: "ok", sid: 0, speed: 0.5, requestId: 7 });
   assert.equal(fast.ok && slow.ok, true, "lattice edges 0.5 and 3 are legal");
 });
 
@@ -104,10 +106,11 @@ test("every worker response kind validates with exact keys", () => {
     { type: "init-fail", engine: "stt", message: "broken" },
     { type: "stt-partial", transcript: "" },
     { type: "stt-final", transcript: "hello there" },
-    { type: "tts-chunk", sequence: 0, samples, sampleRate: 24_000 },
-    { type: "tts-ended", totalSamples: samples.length, sampleRate: 24_000, aborted: false },
+    { type: "tts-chunk", requestId: 7, sequence: 0, samples, sampleRate: 24_000 },
+    { type: "tts-ended", requestId: 7, totalSamples: samples.length, sampleRate: 24_000, aborted: false },
+    { type: "tts-ended", requestId: 8, totalSamples: 0, sampleRate: 24_000, aborted: true },
     { type: "worker-error", scope: "stt", message: "boom" },
-    { type: "worker-error", scope: "tts", message: "boom", code: "TTS_FAILURE" },
+    { type: "worker-error", scope: "tts", message: "boom", code: "TTS_FAILURE", requestId: 7 },
   ];
   for (const row of good) {
     assert.equal(validateWorkerResponse(row).ok, true, JSON.stringify(row));
@@ -131,20 +134,22 @@ test("worker responses refuse bad shapes and bounds", () => {
     { type: "stt-final", transcript: "   " },
     { type: "stt-partial", transcript: "x".repeat(4000) },
     { type: "stt-partial", transcript: "ok", rogue: true },
-    { type: "tts-chunk", sequence: 0, samples: new Float32Array(0), sampleRate: 24_000 },
-    {
-      type: "tts-chunk",
-      sequence: 0,
-      samples: new Float32Array(VOICE_PROTOCOL_TTS_CHUNK_SAMPLES + 1),
-      sampleRate: 24_000,
-    },
-    { type: "tts-chunk", sequence: 0, samples: new Int16Array(8), sampleRate: 24_000 },
-    { type: "tts-chunk", sequence: -1, samples, sampleRate: 24_000 },
-    { type: "tts-chunk", sequence: 0, samples, sampleRate: 7999 },
-    { type: "tts-chunk", sequence: 0, samples, sampleRate: 96_001 },
-    { type: "tts-chunk", sequence: 0, samples }, // missing rate
-    { type: "tts-ended", totalSamples: -1, sampleRate: 24_000, aborted: false },
-    { type: "tts-ended", totalSamples: 8, sampleRate: 24_000, aborted: "no" },
+     { type: "tts-chunk", requestId: 7, sequence: 0, samples: new Float32Array(0), sampleRate: 24_000 },
+     {
+       type: "tts-chunk",
+       requestId: 7,
+       sequence: 0,
+       samples: new Float32Array(VOICE_PROTOCOL_TTS_CHUNK_SAMPLES + 1),
+       sampleRate: 24_000,
+     },
+     { type: "tts-chunk", requestId: 7, sequence: 0, samples: new Int16Array(8), sampleRate: 24_000 },
+     { type: "tts-chunk", requestId: 7, sequence: -1, samples, sampleRate: 24_000 },
+     { type: "tts-chunk", requestId: 7, sequence: 0, samples, sampleRate: 7999 },
+     { type: "tts-chunk", requestId: 7, sequence: 0, samples, sampleRate: 96_001 },
+     { type: "tts-chunk", requestId: 7, sequence: 0, samples }, // missing rate
+      { type: "tts-ended", requestId: 7, totalSamples: -1, sampleRate: 24_000, aborted: false },
+      { type: "tts-ended", requestId: 7, totalSamples: 0, sampleRate: 24_000, aborted: false },
+     { type: "tts-ended", requestId: 7, totalSamples: 8, sampleRate: 24_000, aborted: "no" },
     { type: "worker-error", scope: "cpu", message: "boom" },
     { type: "worker-error", scope: "stt", message: "" },
     { type: "worker-error", scope: "stt", message: "boom", code: "NOT_A_CODE" },

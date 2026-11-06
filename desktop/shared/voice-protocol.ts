@@ -19,7 +19,9 @@
 
 import {
   VOICE_FAILURE_MESSAGE_MAX_LENGTH,
+  VOICE_PLAYBACK_REQUEST_ID_MAX,
   VOICE_SEQUENCE_MAX,
+  VOICE_TTS_MAX_SAMPLES,
   VOICE_TEXT_MAX_LENGTH,
   type PayloadValidation,
 } from "./ipc-contract";
@@ -61,7 +63,7 @@ export type WorkerRequest =
   /** End-of-stream: drain the decoder, return the final transcript. */
   | { type: "stt-end" }
   /** Synthesize bounded text; emits tts-chunk events then tts-ended. */
-  | { type: "tts-speak"; text: string; sid: number; speed: number }
+  | { type: "tts-speak"; text: string; sid: number; speed: number; requestId: number }
   /** Cancel in-flight synthesis at the next chunk boundary. */
   | { type: "tts-abort" }
   /** Graceful worker shutdown (releases native handles). */
@@ -175,13 +177,23 @@ export function validateWorkerRequest(value: unknown): PayloadValidation<WorkerR
       return { ok: true, value: { type: "stt-end" } };
     }
     case "tts-speak": {
-      // Sorted keys: [sid, speed, text, type].
-      if (keys.length !== 4 || keys[0] !== "sid" || keys[1] !== "speed" || keys[2] !== "text") {
-        return { ok: false, reason: "Worker 'tts-speak' accepts exactly text, sid, speed." };
+      // Sorted keys: [requestId, sid, speed, text, type].
+      if (
+        keys.length !== 5 ||
+        keys[0] !== "requestId" ||
+        keys[1] !== "sid" ||
+        keys[2] !== "speed" ||
+        keys[3] !== "text"
+      ) {
+        return {
+          ok: false,
+          reason: "Worker 'tts-speak' accepts exactly text, sid, speed, and requestId.",
+        };
       }
       const text = (value as { text: unknown }).text;
       const sid = (value as { sid: unknown }).sid;
       const speed = (value as { speed: unknown }).speed;
+      const requestId = (value as { requestId: unknown }).requestId;
       if (typeof text !== "string" || text.trim().length === 0 || text.length > VOICE_TEXT_MAX_LENGTH) {
         return {
           ok: false,
@@ -199,7 +211,15 @@ export function validateWorkerRequest(value: unknown): PayloadValidation<WorkerR
       ) {
         return { ok: false, reason: "Worker 'tts-speak' speed must be within 0.5..3." };
       }
-      return { ok: true, value: { type: "tts-speak", text, sid, speed } };
+      if (
+        typeof requestId !== "number" ||
+        !Number.isInteger(requestId) ||
+        requestId < 0 ||
+        requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+      ) {
+        return { ok: false, reason: "Worker 'tts-speak' requestId is out of bounds." };
+      }
+      return { ok: true, value: { type: "tts-speak", text, sid, speed, requestId } };
     }
     case "tts-abort": {
       if (keys.length !== 1) {
@@ -232,10 +252,28 @@ export type WorkerResponse =
   /** Emitted once per 'stt-end'. Non-empty, bounded. */
   | { type: "stt-final"; transcript: string }
   /** One bounded PCM chunk of synthesized audio (float32 samples). */
-  | { type: "tts-chunk"; sequence: number; samples: Float32Array; sampleRate: number }
-  | { type: "tts-ended"; totalSamples: number; sampleRate: number; aborted: boolean }
+  | {
+      type: "tts-chunk";
+      requestId: number;
+      sequence: number;
+      samples: Float32Array;
+      sampleRate: number;
+    }
+  | {
+      type: "tts-ended";
+      requestId: number;
+      totalSamples: number;
+      sampleRate: number;
+      aborted: boolean;
+    }
   /** Request-level failures carry fixed, non-sensitive copy. */
-  | { type: "worker-error"; scope: "stt" | "tts" | "engine"; message: string; code?: string };
+  | {
+      type: "worker-error";
+      scope: "stt" | "tts" | "engine";
+      message: string;
+      code?: string;
+      requestId?: number;
+    };
 
 export function isSttInitOk(value: WorkerResponse): value is Extract<WorkerResponse, { type: "init-ok" }> {
   return value.type === "init-ok";
@@ -346,17 +384,23 @@ export function validateWorkerResponse(value: unknown): PayloadValidation<Worker
       return { ok: true, value: { type: "stt-final", transcript } };
     }
     case "tts-chunk": {
-      // Sorted keys: [sampleRate, samples, sequence, type]
-      // ('R' in sampleRate sorts before 's' in samples).
+      // Sorted keys: [requestId, sampleRate, samples, sequence, type].
+      // ('R' in requestId/sampleRate sorts before lowercase letters).
       if (
-        keys.length !== 4 ||
-        keys[0] !== "sampleRate" ||
-        keys[1] !== "samples" ||
-        keys[2] !== "sequence"
+        keys.length !== 5 ||
+        keys[0] !== "requestId" ||
+        keys[1] !== "sampleRate" ||
+        keys[2] !== "samples" ||
+        keys[3] !== "sequence"
       ) {
         return { ok: false, reason: "Bad tts-chunk." };
       }
-      const v = value as { sequence: unknown; samples: unknown; sampleRate: unknown };
+      const v = value as {
+        requestId: unknown;
+        sequence: unknown;
+        samples: unknown;
+        sampleRate: unknown;
+      };
       const samples = v.samples;
       if (
         !(samples instanceof Float32Array) ||
@@ -364,6 +408,14 @@ export function validateWorkerResponse(value: unknown): PayloadValidation<Worker
         samples.length > VOICE_PROTOCOL_TTS_CHUNK_SAMPLES
       ) {
         return { ok: false, reason: "Bad tts-chunk samples." };
+      }
+      if (
+        typeof v.requestId !== "number" ||
+        !Number.isInteger(v.requestId) ||
+        v.requestId < 0 ||
+        v.requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+      ) {
+        return { ok: false, reason: "Bad tts-chunk requestId." };
       }
       if (
         typeof v.sequence !== "number" ||
@@ -383,20 +435,47 @@ export function validateWorkerResponse(value: unknown): PayloadValidation<Worker
       }
       return {
         ok: true,
-        value: { type: "tts-chunk", sequence: v.sequence, samples, sampleRate: v.sampleRate },
+        value: {
+          type: "tts-chunk",
+          requestId: v.requestId,
+          sequence: v.sequence,
+          samples,
+          sampleRate: v.sampleRate,
+        },
       };
     }
     case "tts-ended": {
-      if (keys.length !== 4 || keys[2] !== "totalSamples") {
+      // Sorted keys: [aborted, requestId, sampleRate, totalSamples, type].
+      if (
+        keys.length !== 5 ||
+        keys[0] !== "aborted" ||
+        keys[1] !== "requestId" ||
+        keys[2] !== "sampleRate" ||
+        keys[3] !== "totalSamples"
+      ) {
         return { ok: false, reason: "Bad tts-ended." };
       }
-      const v = value as { totalSamples: unknown; sampleRate: unknown; aborted: unknown };
+      const v = value as {
+        totalSamples: unknown;
+        sampleRate: unknown;
+        aborted: unknown;
+        requestId: unknown;
+      };
       if (
         typeof v.totalSamples !== "number" ||
         !Number.isInteger(v.totalSamples) ||
-        v.totalSamples < 0
+        v.totalSamples < 0 ||
+        v.totalSamples > VOICE_TTS_MAX_SAMPLES
       ) {
         return { ok: false, reason: "Bad tts-ended samples." };
+      }
+      if (
+        typeof v.requestId !== "number" ||
+        !Number.isInteger(v.requestId) ||
+        v.requestId < 0 ||
+        v.requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+      ) {
+        return { ok: false, reason: "Bad tts-ended requestId." };
       }
       if (
         typeof v.sampleRate !== "number" ||
@@ -409,23 +488,47 @@ export function validateWorkerResponse(value: unknown): PayloadValidation<Worker
       if (typeof v.aborted !== "boolean") {
         return { ok: false, reason: "Bad tts-ended flag." };
       }
+      if (v.totalSamples === 0 && !v.aborted) {
+        return { ok: false, reason: "Bad tts-ended empty success." };
+      }
       return {
         ok: true,
-        value: { type: "tts-ended", totalSamples: v.totalSamples, sampleRate: v.sampleRate, aborted: v.aborted },
+        value: {
+          type: "tts-ended",
+          requestId: v.requestId,
+          totalSamples: v.totalSamples,
+          sampleRate: v.sampleRate,
+          aborted: v.aborted,
+        },
       };
     }
     case "worker-error": {
-      // Sorted keys: [code (optional), message, scope] + discriminator.
-      if (keys.length !== 3 && keys.length !== 4) {
+      // Sorted keys include optional code and requestId, plus message/scope/type.
+      if (keys.length < 3 || keys.length > 5) {
         return { ok: false, reason: "Bad worker-error." };
       }
-      const v = value as { scope: unknown; message: unknown; code?: unknown };
+      const allowed = new Set(["code", "message", "requestId", "scope", "type"]);
+      if (keys.some((key) => !allowed.has(key)) || !keys.includes("message") || !keys.includes("scope") || !keys.includes("type")) {
+        return { ok: false, reason: "Bad worker-error keys." };
+      }
+      const v = value as { scope: unknown; message: unknown; code?: unknown; requestId?: unknown };
       if (v.scope !== "stt" && v.scope !== "tts" && v.scope !== "engine") {
         return { ok: false, reason: "Bad worker-error scope." };
       }
       let code: string | undefined;
       if (keys.length === 4) {
-        if (keys[0] !== "code") return { ok: false, reason: "Bad worker-error code key." };
+        if (keys.includes("code")) {
+          if (typeof v.code !== "string" || !isVoiceErrorCode(v.code)) {
+            return { ok: false, reason: "Bad worker-error code." };
+          }
+          code = v.code;
+        } else if (!keys.includes("requestId")) {
+          return { ok: false, reason: "Bad worker-error optional key." };
+        }
+      } else if (keys.length === 5) {
+        if (!keys.includes("code") || !keys.includes("requestId")) {
+          return { ok: false, reason: "Bad worker-error optional keys." };
+        }
         if (typeof v.code !== "string" || !isVoiceErrorCode(v.code)) {
           return { ok: false, reason: "Bad worker-error code." };
         }
@@ -435,9 +538,27 @@ export function validateWorkerResponse(value: unknown): PayloadValidation<Worker
       if (message.length === 0 || message.length > VOICE_FAILURE_MESSAGE_MAX_LENGTH) {
         return { ok: false, reason: "Bad worker-error message." };
       }
+      let requestId: number | undefined;
+      if (keys.includes("requestId")) {
+        if (
+          typeof v.requestId !== "number" ||
+          !Number.isInteger(v.requestId) ||
+          v.requestId < 0 ||
+          v.requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+        ) {
+          return { ok: false, reason: "Bad worker-error requestId." };
+        }
+        requestId = v.requestId;
+      }
       return {
         ok: true,
-        value: { type: "worker-error", scope: v.scope, message, ...(code ? { code } : {}) },
+        value: {
+          type: "worker-error",
+          scope: v.scope,
+          message,
+          ...(code ? { code } : {}),
+          ...(requestId !== undefined ? { requestId } : {}),
+        },
       };
     }
     default:

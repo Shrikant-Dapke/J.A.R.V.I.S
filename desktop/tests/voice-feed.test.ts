@@ -31,7 +31,7 @@ test("microphone sequence gate accepts increasing chunks and drops replays", () 
   assert.deepEqual(gate.accept(0), { accepted: true, sequence: 0 });
 });
 
-function createVoiceStub(feeds: Float32Array[]): VoiceEngine {
+function createVoiceStub(feeds: Float32Array[], spokenRequestIds: number[] = []): VoiceEngine {
   return {
     status: () => ({
       engineAvailable: true,
@@ -51,7 +51,10 @@ function createVoiceStub(feeds: Float32Array[]): VoiceEngine {
     },
     end: async () => ipcOk({ state: "transcript_ready", transcript: "test" }),
     cancel: () => ({ ok: true, state: "cancelled" }),
-    speak: async () => ({ ok: true, state: "speaking" }),
+    speak: async (_text, _sid, _speed, requestId) => {
+      spokenRequestIds.push(requestId ?? -1);
+      return { ok: true, state: "speaking" };
+    },
     stop: () => ({ ok: true, state: "cancelled" }),
     acknowledge: () => ({ ok: true, state: "idle" }),
     dispose: () => undefined,
@@ -59,7 +62,7 @@ function createVoiceStub(feeds: Float32Array[]): VoiceEngine {
   };
 }
 
-function createRegistry(feeds: Float32Array[]) {
+function createRegistry(feeds: Float32Array[], spokenRequestIds: number[] = []) {
   const deps: IpcHandlerDeps = {
     client: {} as HttpBackendApiClient,
     getStatus: () => ({
@@ -71,7 +74,7 @@ function createRegistry(feeds: Float32Array[]) {
       runtime: { electron: "test", node: "test" },
     }),
     navigationTrust: { devServerUrl: "http://127.0.0.1:5173", isDistHosting: false },
-    voice: createVoiceStub(feeds),
+    voice: createVoiceStub(feeds, spokenRequestIds),
   };
   return createJarvisIpcRegistry(deps);
 }
@@ -121,4 +124,25 @@ test("voice-feed rejects unauthorized frames before handling PCM", async () => {
   assert.equal(result.ok, false);
   if (!result.ok) assert.equal(result.code, "UNAUTHORIZED_FRAME");
   assert.equal(feeds.length, 0);
+});
+
+test("tts-speak forwards the bounded playback request identity", async () => {
+  const feeds: Float32Array[] = [];
+  const spokenRequestIds: number[] = [];
+  const registry = createRegistry(feeds, spokenRequestIds);
+  const result = await registry.dispatch(
+    "jarvis:tts-speak",
+    { text: "  hello locally  ", requestId: 73 },
+    "http://127.0.0.1:5173/",
+  );
+  assert.equal(result.ok, true);
+  assert.deepEqual(spokenRequestIds, [73]);
+
+  const malformed = await registry.dispatch(
+    "jarvis:tts-speak",
+    { text: "hello locally", requestId: 1.5 },
+    "http://127.0.0.1:5173/",
+  );
+  assert.equal(malformed.ok, false);
+  if (!malformed.ok) assert.equal(malformed.code, "BAD_PAYLOAD");
 });

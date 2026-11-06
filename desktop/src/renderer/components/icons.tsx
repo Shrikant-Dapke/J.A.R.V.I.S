@@ -118,6 +118,23 @@ export function MicIcon(props: IconProps) {
   );
 }
 
+export function SpeakerIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <path d="M4 10v4h3l4 3V7l-4 3H4Z" />
+      <path d="M15 9.5a4 4 0 0 1 0 5M17.5 7a7.5 7.5 0 0 1 0 10" />
+    </Base>
+  );
+}
+
+export function StopIcon(props: IconProps) {
+  return (
+    <Base {...props}>
+      <rect x="6" y="6" width="12" height="12" rx="1.5" />
+    </Base>
+  );
+}
+
 export function TrashIcon(props: IconProps) {
   return (
     <Base {...props}>

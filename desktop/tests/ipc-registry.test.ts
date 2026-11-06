@@ -364,25 +364,31 @@ test("voice command channels accept only the canonical empty payload", async () 
   }
 });
 
-test("tts-speak payload bounds: exact shape, trimmed text, 2000-char ceiling", async () => {
-  const ok = (await dispatch("jarvis:tts-speak", { text: "  status ready  " })) as IpcResult<{
-    payload: { text: string };
+test("tts-speak payload bounds: exact shape, identity, trimmed text, 2000-char ceiling", async () => {
+  const ok = (await dispatch("jarvis:tts-speak", { text: "  status ready  ", requestId: 4 })) as IpcResult<{
+    payload: { text: string; requestId: number };
   }>;
   assert.equal(ok.ok, true);
-  if (ok.ok) assert.equal(ok.data.payload.text, "status ready", "text is trimmed at the wire");
+  if (ok.ok) {
+    assert.equal(ok.data.payload.text, "status ready", "text is trimmed at the wire");
+    assert.equal(ok.data.payload.requestId, 4);
+  }
 
   // Exactly the 2000-char ceiling passes.
-  const atLimit = await dispatch("jarvis:tts-speak", { text: "x".repeat(2000) });
+  const atLimit = await dispatch("jarvis:tts-speak", { text: "x".repeat(2000), requestId: 4 });
   assert.equal(atLimit.ok, true, "2000 characters must be accepted");
 
   for (const bad of [
-    { text: "   " },
-    { text: "" },
-    { text: "x".repeat(2001) },
-    { text: 42 },
-    { text: null },
-    {}, // missing key
-    { text: "hello", voice: "alloy" }, // extra key smuggling
+    { text: "   ", requestId: 4 },
+    { text: "", requestId: 4 },
+    { text: "x".repeat(2001), requestId: 4 },
+    { text: 42, requestId: 4 },
+    { text: null, requestId: 4 },
+    {}, // missing keys
+    { text: "hello", requestId: 4, voice: "alloy" }, // extra key smuggling
+    { text: "hello" }, // missing identity
+    { text: "hello", requestId: -1 },
+    { text: "hello", requestId: 1.5 },
   ]) {
     const result = (await dispatch("jarvis:tts-speak", bad)) as IpcResult<never>;
     assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", JSON.stringify(bad).slice(0, 40));
@@ -413,7 +419,7 @@ test("voice handler stubs fail closed with honest ENGINE_UNAVAILABLE copy", asyn
     "jarvis:tts-speak",
     "jarvis:tts-stop",
   ] as const) {
-    const payload = channel === "jarvis:tts-speak" ? { text: "hello" } : {};
+    const payload = channel === "jarvis:tts-speak" ? { text: "hello", requestId: 1 } : {};
     const result = await registry.dispatch(channel, payload, "http://127.0.0.1:5173/");
     assert.equal(result.ok, false, channel);
     if (!result.ok) {

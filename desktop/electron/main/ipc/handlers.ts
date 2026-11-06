@@ -157,7 +157,7 @@ export function createJarvisIpcRegistry(deps: IpcHandlerDeps): IpcRegistry {
       if (!deps.voice) {
         return ipcError("ENGINE_UNAVAILABLE", VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"]);
       }
-      return voiceOutcomeToIpc(await deps.voice.speak(payload.text));
+      return voiceOutcomeToIpc(await deps.voice.speak(payload.text, 0, 1, payload.requestId));
     },
     "jarvis:tts-stop": async () => {
       if (!deps.voice) {

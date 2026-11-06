@@ -21,7 +21,17 @@
  */
 
 import { createVoiceMachine, isVoiceErrorCode, validateVoiceEventPayload, type VoiceErrorCode, type VoiceEventPayload, type VoiceFailure, type VoiceState } from "../../../shared/voice-engine";
-import { ipcError, ipcOk, type IpcErrorCode, type IpcResult } from "../../../shared/ipc-contract";
+import {
+  ipcError,
+  ipcOk,
+  VOICE_PCM_CHUNK_MAX_BYTES,
+  VOICE_PLAYBACK_REQUEST_ID_MAX,
+  VOICE_TTS_CHANNELS,
+  VOICE_TTS_ENCODING,
+  VOICE_TTS_MAX_SAMPLES,
+  type IpcErrorCode,
+  type IpcResult,
+} from "../../../shared/ipc-contract";
 import { validateWorkerRequest, validateWorkerResponse, type WorkerRequest, type WorkerResponse } from "../../../shared/voice-protocol";
 import type { VoiceModelManager } from "./model-manager";
 
@@ -102,7 +112,7 @@ export type VoiceEngine = {
   feed: (samples: Float32Array) => VoiceEngineOutcome;
   end: () => Promise<IpcResult<{ state: VoiceState; transcript: string }>>;
   cancel: () => VoiceEngineOutcome;
-  speak: (text: string, sid?: number, speed?: number) => Promise<VoiceEngineOutcome>;
+  speak: (text: string, sid?: number, speed?: number, requestId?: number) => Promise<VoiceEngineOutcome>;
   stop: () => VoiceEngineOutcome;
   /** Acknowledge terminal states (failed/cancelled → idle). */
   acknowledge: () => VoiceEngineOutcome;
@@ -128,6 +138,8 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
   let awaitingTimer: ReturnType<typeof setTimeout> | null = null;
   /** The worker knows these legs; set as init-ok confirms them. */
   let session: SessionPhase | null = null;
+  /** Identity of the active renderer-owned synthesis request. */
+  let speakingRequestId: number | null = null;
 
   /* ------------------------- event plumbing ----------------------- */
 
@@ -252,7 +264,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
   const emitTtsChunk = (response: TtsChunk): void => {
     const sampleCount = response.samples.length;
     if (sampleCount === 0) return;
-    if (sampleCount * 2 > 65_536) {
+    if (sampleCount * 2 > VOICE_PCM_CHUNK_MAX_BYTES) {
       trace(`[voice] refused oversized tts chunk (${sampleCount} samples)`);
       return;
     }
@@ -262,10 +274,26 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
       const clamped = Math.max(-1, Math.min(1, response.samples[i]));
       view.setInt16(i * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
     }
-    emit({ kind: "tts-chunk", pcm, sequence: response.sequence, sampleRate: response.sampleRate });
+    emit({
+      kind: "tts-chunk",
+      pcm,
+      requestId: response.requestId,
+      sequence: response.sequence,
+      sampleRate: response.sampleRate,
+      channels: VOICE_TTS_CHANNELS,
+      encoding: VOICE_TTS_ENCODING,
+    });
   };
 
   const routeWorkerError = (response: WorkerError): void => {
+    if (
+      response.requestId !== undefined &&
+      (session !== "speaking" || speakingRequestId !== response.requestId)
+    ) {
+      // A late error from a cancelled/superseded synthesis must not poison
+      // the newer playback request.
+      return;
+    }
     const fallback: VoiceErrorCode =
       response.scope === "stt" ? "STT_FAILURE" : response.scope === "tts" ? "TTS_FAILURE" : "ENGINE_UNAVAILABLE";
     const code: VoiceErrorCode =
@@ -303,10 +331,17 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
         if (awaiting?.kind === "session" && session === "stt") settleAwaiting(response);
         return;
       case "tts-chunk":
+        if (session !== "speaking" || speakingRequestId !== response.requestId) return;
         emitTtsChunk(response);
         return;
       case "tts-ended":
-        if (awaiting?.kind === "session" && session === "speaking") settleAwaiting(response);
+        if (
+          awaiting?.kind === "session" &&
+          session === "speaking" &&
+          speakingRequestId === response.requestId
+        ) {
+          settleAwaiting(response);
+        }
         return;
       case "worker-error":
         routeWorkerError(response);
@@ -470,6 +505,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
     if (state === "speaking") abortSynthesis();
     if (state === "listening" || state === "armed") killTransport();
     settleAwaiting(null);
+    speakingRequestId = null;
     return applyAction({ type: "cancel" });
   };
 
@@ -477,41 +513,114 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
     const state = machine.getState();
     if (state === "speaking") abortSynthesis();
     settleAwaiting(null);
+    speakingRequestId = null;
     return applyAction({ type: "cancel" });
   };
 
-  const speak = async (text: string, sid = 0, speed = 1): Promise<VoiceEngineOutcome> => {
+  const speak = async (
+    text: string,
+    sid = 0,
+    speed = 1,
+    requestId = 0,
+  ): Promise<VoiceEngineOutcome> => {
+    if (
+      !Number.isInteger(requestId) ||
+      requestId < 0 ||
+      requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+    ) {
+      return { ok: false, code: "BAD_PAYLOAD", message: "TTS request identity is out of bounds." };
+    }
+    const currentState = machine.getState();
+    if (currentState === "failed" || currentState === "cancelled") {
+      const reset = applyAction({ type: "reset" });
+      if (!reset.ok) return reset;
+    }
     const guard = requireState("idle", "transcript_ready");
     if (guard) return guard;
     const bounded = text.slice(0, TRANSCRIPT_MAX);
-    const init = await loadTts();
-    if ("error" in init) {
-      const missing = init.error.includes("missing");
-      failMachine(missing ? "MODEL_MISSING" : "TTS_FAILURE", init.error);
-      return { ok: false, code: missing ? "MODEL_MISSING" : "TTS_FAILURE", message: init.error };
-    }
     const began = applyAction({ type: "speak_begin" });
     if (!began.ok) return began;
+    speakingRequestId = requestId;
+
+    const init = await loadTts();
+    if ("error" in init) {
+      if (speakingRequestId !== requestId || machine.getState() !== "speaking") {
+        return {
+          ok: false,
+          code: "RECORDING_CANCELLED",
+          message: "Speech playback was cancelled.",
+        };
+      }
+      const missing = init.error.includes("missing");
+      failMachine(missing ? "MODEL_MISSING" : "TTS_FAILURE", init.error);
+      speakingRequestId = null;
+      return { ok: false, code: missing ? "MODEL_MISSING" : "TTS_FAILURE", message: init.error };
+    }
     const ended = await dispatchAwaiting(
       "session",
       "speaking",
-      { type: "tts-speak", text: bounded, sid, speed: Math.max(0.5, Math.min(3, speed)) },
+      {
+        type: "tts-speak",
+        text: bounded,
+        sid,
+        speed: Math.max(0.5, Math.min(3, speed)),
+        requestId,
+      },
       synthTimeout,
     );
+    if (speakingRequestId !== requestId) {
+      return {
+        ok: false,
+        code: "RECORDING_CANCELLED",
+        message: "Speech playback was cancelled or superseded.",
+      };
+    }
+    if (machine.getState() === "failed") {
+      const recorded = machine.getFailure();
+      speakingRequestId = null;
+      return {
+        ok: false,
+        code: recorded?.code ?? "TTS_FAILURE",
+        message: recorded?.message ?? "Speech synthesis failed.",
+      };
+    }
+    if (machine.getState() !== "speaking") {
+      return {
+        ok: false,
+        code: "RECORDING_CANCELLED",
+        message: "Speech playback was cancelled or superseded.",
+      };
+    }
     if (!ended || ended.type !== "tts-ended") {
       failMachine("TTS_FAILURE", "Synthesis did not finish in time.");
+      speakingRequestId = null;
       return { ok: false, code: "TTS_FAILURE", message: "Synthesis did not finish in time." };
     }
     if (ended.aborted) {
       // The user aborted mid-synthesis while still 'speaking': cancel is
       // the legal transition and records the cancellation honestly.
+      speakingRequestId = null;
       return applyAction({ type: "cancel" });
     }
     const finished = applyAction({ type: "speak_end" });
+    speakingRequestId = null;
     if (!finished.ok) return finished;
     // The closed-set event vocabulary includes tts-ended for NATURAL
     // completion; cancellations are carried by the state event alone.
-    emit({ kind: "tts-ended" });
+    if (
+      ended.type === "tts-ended" &&
+      ended.totalSamples > 0 &&
+      ended.totalSamples <= VOICE_TTS_MAX_SAMPLES
+    ) {
+      emit({
+        kind: "tts-ended",
+        requestId,
+        totalSamples: ended.totalSamples,
+        sampleRate: ended.sampleRate,
+        channels: VOICE_TTS_CHANNELS,
+        encoding: VOICE_TTS_ENCODING,
+      });
+    }
     return { ok: true, state: machine.getState() };
   };
 

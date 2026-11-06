@@ -178,6 +178,8 @@ export type VoiceCommandPayload = EmptyPayload;
 /** `jarvis:tts-speak` payload — the ONLY voice command carrying text. */
 export type TtsSpeakPayload = {
   text: string;
+  /** Renderer-owned identity used to reject stale synthesis events. */
+  requestId: number;
 };
 
 /** Bound for TTS text, transcripts (interim + final), and failure notes. */
@@ -190,16 +192,26 @@ export const VOICE_FAILURE_MESSAGE_MAX_LENGTH = 512;
 export const VOICE_PCM_SAMPLE_RATE = 16_000;
 
 /**
- * One streamed TTS chunk is 16 kHz * 2 bytes = 32 000 B/s, so 1 s of
- * audio is 32 000 bytes; the ceiling admits ~2 s per chunk while keeping
- * any single IPC message bounded.
+ * One streamed TTS chunk is bounded independently of its model-reported
+ * sample rate; at 24 kHz * 2 bytes, the ceiling admits ~1.3 s per chunk
+ * while keeping any single IPC message bounded.
  */
 export const VOICE_PCM_CHUNK_MAX_BYTES = 65_536;
 
 /** Upper bound on streamed TTS chunk sequence numbers. */
 export const VOICE_SEQUENCE_MAX = 1_000_000;
 
-/** Validate `jarvis:tts-speak` (exact single key, trimmed, bounded). */
+/** Upper bound on a renderer-owned TTS playback request identity. */
+export const VOICE_PLAYBACK_REQUEST_ID_MAX = VOICE_SEQUENCE_MAX;
+
+/** TTS transport format: mono signed PCM16 little-endian. */
+export const VOICE_TTS_CHANNELS = 1 as const;
+export const VOICE_TTS_ENCODING = "pcm16le" as const;
+
+/** Bounded full-buffer playback ceiling: 180 seconds at the model's 24 kHz rate. */
+export const VOICE_TTS_MAX_SAMPLES = 24_000 * 180;
+
+/** Validate `jarvis:tts-speak` (exact keys, trimmed text, bounded identity). */
 export function validateTtsSpeakPayload(
   value: unknown,
 ): PayloadValidation<TtsSpeakPayload> {
@@ -207,10 +219,11 @@ export function validateTtsSpeakPayload(
     return { ok: false, reason: "TTS payload must be an object." };
   }
   const keys = Object.keys(value).sort();
-  if (keys.length !== 1 || keys[0] !== "text") {
-    return { ok: false, reason: "TTS payload accepts exactly text." };
+  if (keys.length !== 2 || keys[0] !== "requestId" || keys[1] !== "text") {
+    return { ok: false, reason: "TTS payload accepts exactly requestId and text." };
   }
   const text = (value as { text: unknown }).text;
+  const requestId = (value as { requestId: unknown }).requestId;
   if (typeof text !== "string") {
     return { ok: false, reason: "TTS text must be a string." };
   }
@@ -224,7 +237,15 @@ export function validateTtsSpeakPayload(
       reason: `TTS text exceeds the ${VOICE_TEXT_MAX_LENGTH} character limit.`,
     };
   }
-  return { ok: true, value: { text: trimmed } };
+  if (
+    typeof requestId !== "number" ||
+    !Number.isInteger(requestId) ||
+    requestId < 0 ||
+    requestId > VOICE_PLAYBACK_REQUEST_ID_MAX
+  ) {
+    return { ok: false, reason: "TTS requestId is out of bounds." };
+  }
+  return { ok: true, value: { text: trimmed, requestId } };
 }
 
 /* ------------------------- validation contract --------------------- */
