@@ -31,6 +31,10 @@ test("window options pin the HUD frame defaults", () => {
   assert.equal(options.minHeight, 640);
   assert.equal(options.show, false, "window shows only after ready-to-show");
   assert.equal(options.backgroundColor, "#05070D");
+  const rawOptions = options as unknown as Record<string, unknown>;
+  for (const property of ["skipTaskbar", "visibleOnAllWorkspaces", "parent", "modal"]) {
+    assert.equal(rawOptions[property], undefined, `${property} must not alter window ownership or taskbar visibility`);
+  }
 });
 
 test("navigation allowlist only permits the app's own origins", () => {

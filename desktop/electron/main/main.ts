@@ -10,7 +10,14 @@
  *    performs no network I/O — see shared/ipc-contract.ts).
  */
 
-import { app, BrowserWindow, Menu, dialog, type WebContents } from "electron";
+import {
+  app,
+  BrowserWindow,
+  Menu,
+  dialog,
+  screen,
+  type WebContents,
+} from "electron";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
 import { loadDesktopConfig, type DesktopConfig } from "./config";
@@ -33,6 +40,72 @@ import { VOICE_EVENTS_CHANNEL } from "../../shared/ipc-contract";
 const RENDERER_INDEX = join(__dirname, "..", "..", "renderer", "index.html");
 const PRELOAD_SCRIPT = join(__dirname, "..", "preload", "preload.js");
 const DEV_SERVER_URL_ALLOWED = "http://127.0.0.1:5173";
+const WINDOW_DIAGNOSTICS_ENABLED =
+  process.env.NODE_ENV === "development" ||
+  process.env.JARVIS_WINDOW_DIAGNOSTICS === "1";
+
+type WindowLifecycleEvent =
+  | "created"
+  | "ready-to-show:before-show"
+  | "ready-to-show:after-show"
+  | "did-finish-load"
+  | "show"
+  | "hide"
+  | "minimize"
+  | "restore"
+  | "focus"
+  | "blur"
+  | "close"
+  | "closed"
+  | "moved"
+  | "resized"
+  | "unresponsive"
+  | "responsive"
+  | "renderer-failure";
+
+function logWindowState(
+  window: BrowserWindow,
+  event: WindowLifecycleEvent,
+  details: Record<string, unknown> = {},
+): void {
+  if (!WINDOW_DIAGNOSTICS_ENABLED) return;
+
+  const destroyed = window.isDestroyed();
+  const state: Record<string, unknown> = {
+    event,
+    windowId: destroyed ? null : window.id,
+    isDestroyed: destroyed,
+    isVisible: false,
+    isMinimized: false,
+    bounds: null,
+    ...details,
+  };
+  if (!destroyed) {
+    state.isVisible = window.isVisible();
+    state.isMinimized = window.isMinimized();
+    state.bounds = window.getBounds();
+  }
+  console.log(`[window] ${JSON.stringify(state)}`);
+}
+
+function logStartupState(): void {
+  if (!WINDOW_DIAGNOSTICS_ENABLED) return;
+  console.log(
+    `[window] ${JSON.stringify({
+      event: "startup",
+      argv: process.argv,
+      cwd: process.cwd(),
+      execPath: process.execPath,
+      displays: screen.getAllDisplays().map((display) => ({
+        id: display.id,
+        bounds: display.bounds,
+        workArea: display.workArea,
+        scaleFactor: display.scaleFactor,
+        isPrimary: display.id === screen.getPrimaryDisplay().id,
+      })),
+    })}`,
+  );
+}
 
 /**
  * Voice runtime (Phase 6.4-b). Constructed AFTER `app` is ready (the
@@ -116,13 +189,85 @@ function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow(
     createWindowOptions(createWebPreferences(PRELOAD_SCRIPT)),
   );
+  logWindowState(window, "created");
 
-  // Never show a blank window on load failure; surface it honestly.
-  window.once("ready-to-show", () => window.show());
+  window.on("show", () => logWindowState(window, "show"));
+  window.on("hide", () => logWindowState(window, "hide"));
+  window.on("minimize", () => logWindowState(window, "minimize"));
+  window.on("restore", () => logWindowState(window, "restore"));
+  window.on("focus", () => logWindowState(window, "focus"));
+  window.on("blur", () => logWindowState(window, "blur"));
+  window.on("close", () => logWindowState(window, "close"));
+  window.on("closed", () => logWindowState(window, "closed"));
+  window.on("moved", () => logWindowState(window, "moved"));
+  window.on("resized", () => logWindowState(window, "resized"));
+  window.on("unresponsive", () => logWindowState(window, "unresponsive"));
+  window.on("responsive", () => logWindowState(window, "responsive"));
 
-  void (runtime && runtime.navigationTrust.devServerUrl
+  let rendererFailureReported = false;
+  const reportRendererFailure = (message: string): void => {
+    if (rendererFailureReported) return;
+    rendererFailureReported = true;
+    console.error(`[window] renderer failed to load: ${message}`);
+    if (!window.isDestroyed()) {
+      window.show();
+      window.focus();
+      logWindowState(window, "renderer-failure", { message });
+    }
+  };
+
+  // Show only after the renderer is ready; load failures are logged and
+  // surfaced instead of leaving an invisible process behind.
+  window.once("ready-to-show", () => {
+    console.log(`[window] ready-to-show: ${window.webContents.getURL()}`);
+    logWindowState(window, "ready-to-show:before-show");
+    window.show();
+    window.focus();
+    logWindowState(window, "ready-to-show:after-show");
+  });
+  window.webContents.once("did-finish-load", () => {
+    console.log(`[window] renderer loaded: ${window.webContents.getURL()}`);
+    logWindowState(window, "did-finish-load");
+    if (runtime?.navigationTrust.devServerUrl) {
+      void window.webContents
+        .executeJavaScript(
+          `Promise.resolve(
+            window.jarvis && typeof window.jarvis.backendStatus === "function"
+              ? window.jarvis.backendStatus({})
+              : null
+          ).then((result) => Boolean(result && typeof result.ok === "boolean"))`,
+          true,
+        )
+        .then((bridgeWorks) => {
+          console.log(`[window] preload bridge IPC: ${bridgeWorks ? "available" : "missing"}`);
+        })
+        .catch((error) => {
+          console.error(
+            `[window] preload bridge IPC check failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+    }
+  });
+  window.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      if (isMainFrame) {
+        reportRendererFailure(
+          `${errorDescription} (${errorCode}) at ${validatedURL}`,
+        );
+      }
+    },
+  );
+  window.webContents.on("render-process-gone", (_event, details) => {
+    reportRendererFailure(`render process gone: ${details.reason} (${details.exitCode})`);
+  });
+
+  const loadPromise = runtime && runtime.navigationTrust.devServerUrl
     ? window.loadURL(runtime.navigationTrust.devServerUrl)
-    : window.loadFile(RENDERER_INDEX));
+    : window.loadFile(RENDERER_INDEX);
+  void loadPromise.catch((error) => {
+    reportRendererFailure(error instanceof Error ? error.message : String(error));
+  });
 
   if (runtime && runtime.config.devtools && !app.isPackaged) {
     window.webContents.openDevTools({ mode: "detach" });
@@ -217,6 +362,7 @@ if (!gotSingleInstanceLock) {
   });
 
   void app.whenReady().then(() => {
+    logStartupState();
     try {
       runtime = buildRuntime();
     } catch (error) {
