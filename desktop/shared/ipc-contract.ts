@@ -527,7 +527,7 @@ export function validateVoiceFeedPayload(
   return { ok: true, value: { sequence, pcm } };
 }
 
-</think><tool_call>edit<arg_key>newString</arg_key><arg_value>export const PAYLOAD_VALIDATORS: {
+export const PAYLOAD_VALIDATORS: {
   [K in keyof IpcPayloadMap]: PayloadValidator<K>;
 } = {
   "jarvis:backend-status": validateEmptyPayload,

@@ -1,4 +1,4 @@
-/** IPC registry + preload bridge contract tests (23 channels, per-channel payloads). */
+/** IPC registry + preload bridge contract tests (24 channels, per-channel payloads). */
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -42,6 +42,7 @@ const HANDLERS: IpcHandlers = {
   "jarvis:voice-begin": async (payload) => ipcOk({ channel: "voice-begin", payload }),
   "jarvis:voice-end": async (payload) => ipcOk({ channel: "voice-end", payload }),
   "jarvis:voice-cancel": async (payload) => ipcOk({ channel: "voice-cancel", payload }),
+  "jarvis:voice-feed": async (payload) => ipcOk({ channel: "voice-feed", payload }),
   "jarvis:tts-speak": async (payload) => ipcOk({ channel: "tts-speak", payload }),
   "jarvis:tts-stop": async (payload) => ipcOk({ channel: "tts-stop", payload }),
 };
@@ -54,11 +55,11 @@ function dispatch(channel: IpcChannel, payload: unknown, url = "http://127.0.0.1
   return createIpcRegistry(HANDLERS, trusted).dispatch(channel, payload, url);
 }
 
-test("preload bridge covers every registered channel exactly (23 channels)", () => {
+test("preload bridge covers every registered channel exactly (24 channels)", () => {
   const channels = PRELOAD_METHODS.map((m) => m.channel);
   const registered = Object.values(IPC_CHANNELS);
   assert.equal(channels.length, registered.length);
-  assert.equal(channels.length, 23);
+  assert.equal(channels.length, 24);
   assert.deepEqual([...channels].sort(), [...registered].sort());
   for (const method of PRELOAD_METHODS) {
     assert.match(method.channel, /^jarvis:/);
@@ -71,7 +72,7 @@ test("every channel has a payload validator in the shared table", () => {
     const validator = PAYLOAD_VALIDATORS[channel as keyof IpcPayloadMap];
     assert.equal(typeof validator, "function", `missing validator for ${channel}`);
   }
-  assert.equal(Object.keys(PAYLOAD_VALIDATORS).length, 23);
+  assert.equal(Object.keys(PAYLOAD_VALIDATORS).length, 24);
 });
 
 test("dispatch passes the handler envelope through without re-wrapping", async () => {
