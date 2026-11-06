@@ -26,8 +26,7 @@ import {
   PLAN_STEP_REQUEST_TIMEOUT_MS,
   PLANS_TIMEOUT_MS,
 } from "../api/client";
-import { ipcError, ipcOk, PRELOAD_METHODS, type ApprovalIdPayload, type BackendStatus, type ChatSendPayload, type ConversationIdPayload, type ConversationListPayload, type EmptyPayload, type IpcResult, type PlanIdPayload, type PlanStepPayload, type TtsSpeakPayload, type VoiceFeedPayload, type VoiceStatusView } from "../../../shared/ipc-contract";
-import { pcm16BytesToFloat32 } from "../../../shared/voice-audio";
+import { ipcError, ipcOk, PRELOAD_METHODS, type ApprovalIdPayload, type BackendStatus, type ChatSendPayload, type ConversationIdPayload, type ConversationListPayload, type EmptyPayload, type IpcResult, type PlanIdPayload, type PlanStepPayload, type TtsSpeakPayload, type VoiceStatusView } from "../../../shared/ipc-contract";
 import { VOICE_ERROR_COPY } from "../../../shared/voice-engine";
 import { shouldAllowNavigation } from "../app-security";
 import type { VoiceEngine } from "../voice/voice-engine";
@@ -130,16 +129,6 @@ export function createJarvisIpcRegistry(deps: IpcHandlerDeps): IpcRegistry {
         return ipcError("ENGINE_UNAVAILABLE", VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"]);
       }
       return voiceOutcomeToIpc(deps.voice.cancel());
-    },
-    "jarvis:voice-feed": async (payload: VoiceFeedPayload) => {
-      if (!deps.voice) {
-        return ipcError("ENGINE_UNAVAILABLE", VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"]);
-      }
-      // The channel validator has already bounded the chunk (PCM16 LE,
-      // even byte count, ≤ VOICE_PCM_CHUNK_MAX_BYTES; sequence legality
-      // is enforced by the engine state machine guards). Decode to the
-      // engine's native mono float32 at the fixed 16 kHz rate.
-      return voiceOutcomeToIpc(deps.voice.feed(pcm16BytesToFloat32(payload.pcm)));
     },
     "jarvis:tts-speak": async (payload: TtsSpeakPayload) => {
       if (!deps.voice) {
