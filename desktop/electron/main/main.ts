@@ -17,6 +17,9 @@ import { loadDesktopConfig, type DesktopConfig } from "./config";
 import { getSessionId, maskSessionId } from "./session";
 import { HttpBackendApiClient } from "./api/client";
 import { createJarvisIpcRegistry, registerIpcHandlers } from "./ipc/handlers";
+import { createModelManager } from "./voice/model-manager";
+import { createVoiceEngine, type VoiceEngine } from "./voice/voice-engine";
+import { createUtilityProcessTransportFactory } from "./voice/voice-transport";
 import {
   createWebPreferences,
   createWindowOptions,
@@ -24,15 +27,43 @@ import {
   denyOpenWindow,
 } from "./app-security";
 import type { BackendStatus } from "../../shared/ipc-contract";
+import { VOICE_EVENTS_CHANNEL } from "../../shared/ipc-contract";
 
 const RENDERER_INDEX = join(__dirname, "..", "..", "renderer", "index.html");
 const PRELOAD_SCRIPT = join(__dirname, "..", "preload", "preload.js");
 const DEV_SERVER_URL_ALLOWED = "http://127.0.0.1:5173";
 
+/**
+ * Voice runtime (Phase 6.4-b). Constructed AFTER `app` is ready (the
+ * models root lives under the user-data profile). STRICTLY lazy: building
+ * this creates the model manager and the engine facade only — no worker
+ * process is forked and no model is loaded or DOWNLOADED until a user
+ * action demands it (models appear only via `voice-prepare-models`).
+ */
+function createVoiceRuntime(): VoiceEngine {
+  const baseDir = join(app.getPath("userData"), "models");
+  const models = createModelManager({ baseDir });
+  const engine = createVoiceEngine({
+    models,
+    createTransport: createUtilityProcessTransportFactory(),
+    trace: (message) => console.log(message),
+  });
+  // The single main → renderer voice event channel. Payloads are already
+  // validated by the engine (validateVoiceEventPayload) before reaching
+  // here; the renderer receives bounded plain data only.
+  engine.subscribe((event) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.isDestroyed()) window.webContents.send(VOICE_EVENTS_CHANNEL, event);
+    }
+  });
+  return engine;
+}
+
 type AppRuntime = {
   config: DesktopConfig;
   client: HttpBackendApiClient;
   navigationTrust: { devServerUrl: string | null; isDistHosting: boolean };
+  voice: VoiceEngine;
 };
 
 let runtime: AppRuntime | null = null;
@@ -61,7 +92,7 @@ function buildRuntime(): AppRuntime {
     );
   }
 
-  return { config, client, navigationTrust: { devServerUrl, isDistHosting: devServerUrl === null } };
+  return { config, client, navigationTrust: { devServerUrl, isDistHosting: devServerUrl === null }, voice: createVoiceRuntime() };
 }
 
 function getBackendStatus(): BackendStatus {
@@ -157,6 +188,7 @@ if (!gotSingleInstanceLock) {
       client: runtime.client,
       getStatus: getBackendStatus,
       navigationTrust: runtime.navigationTrust,
+      voice: runtime.voice,
     }));
 
     createMainWindow();
@@ -167,6 +199,7 @@ if (!gotSingleInstanceLock) {
   });
 
   app.on("window-all-closed", () => {
+    runtime?.voice.dispose();
     app.quit();
   });
 }

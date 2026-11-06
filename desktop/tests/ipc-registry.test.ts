@@ -1,16 +1,18 @@
-/** IPC registry + preload bridge contract tests (15 channels, per-channel payloads). */
+/** IPC registry + preload bridge contract tests (23 channels, per-channel payloads). */
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
   IPC_CHANNELS,
   PAYLOAD_VALIDATORS,
+  ipcError,
   ipcOk,
   PRELOAD_METHODS,
   type IpcChannel,
   type IpcPayloadMap,
   type IpcResult,
 } from "../shared/ipc-contract";
+import { VOICE_ERROR_COPY } from "../shared/voice-engine";
 import { createIpcRegistry, type IpcHandlers } from "../electron/main/ipc/ipc-registry";
 
 /** Every channel echoes a distinct marker so tests can identify routing. */
@@ -32,6 +34,16 @@ const HANDLERS: IpcHandlers = {
   "jarvis:request-plan-step": async (payload) => ipcOk({ channel: "request-plan-step", payload }),
   "jarvis:resolve-plan-recovery": async (payload) =>
     ipcOk({ channel: "resolve-plan-recovery", payload }),
+  // Phase 6.4 voice echo stubs (handlers.ts routes the real rows).
+  "jarvis:voice-status": async (payload) => ipcOk({ channel: "voice-status", payload }),
+  "jarvis:voice-prepare-models": async (payload) =>
+    ipcOk({ channel: "voice-prepare-models", payload }),
+  "jarvis:voice-arm": async (payload) => ipcOk({ channel: "voice-arm", payload }),
+  "jarvis:voice-begin": async (payload) => ipcOk({ channel: "voice-begin", payload }),
+  "jarvis:voice-end": async (payload) => ipcOk({ channel: "voice-end", payload }),
+  "jarvis:voice-cancel": async (payload) => ipcOk({ channel: "voice-cancel", payload }),
+  "jarvis:tts-speak": async (payload) => ipcOk({ channel: "tts-speak", payload }),
+  "jarvis:tts-stop": async (payload) => ipcOk({ channel: "tts-stop", payload }),
 };
 
 const VALID_UUID = "123e4567-e89b-12d3-a456-426614174000";
@@ -42,11 +54,11 @@ function dispatch(channel: IpcChannel, payload: unknown, url = "http://127.0.0.1
   return createIpcRegistry(HANDLERS, trusted).dispatch(channel, payload, url);
 }
 
-test("preload bridge covers every registered channel exactly (15 channels)", () => {
+test("preload bridge covers every registered channel exactly (23 channels)", () => {
   const channels = PRELOAD_METHODS.map((m) => m.channel);
   const registered = Object.values(IPC_CHANNELS);
   assert.equal(channels.length, registered.length);
-  assert.equal(channels.length, 15);
+  assert.equal(channels.length, 23);
   assert.deepEqual([...channels].sort(), [...registered].sort());
   for (const method of PRELOAD_METHODS) {
     assert.match(method.channel, /^jarvis:/);
@@ -59,7 +71,7 @@ test("every channel has a payload validator in the shared table", () => {
     const validator = PAYLOAD_VALIDATORS[channel as keyof IpcPayloadMap];
     assert.equal(typeof validator, "function", `missing validator for ${channel}`);
   }
-  assert.equal(Object.keys(PAYLOAD_VALIDATORS).length, 15);
+  assert.equal(Object.keys(PAYLOAD_VALIDATORS).length, 23);
 });
 
 test("dispatch passes the handler envelope through without re-wrapping", async () => {
@@ -323,4 +335,98 @@ test("the workspace listing channels share the conversation page bounds", async 
     >;
     assert.equal(extra.ok ? null : extra.code, "BAD_PAYLOAD");
   }
+});
+
+/* -------------------------------------------------------------------- */
+/* Phase 6.4 voice channels                                              */
+/* -------------------------------------------------------------------- */
+
+test("voice command channels accept only the canonical empty payload", async () => {
+  for (const channel of [
+    "jarvis:voice-status",
+    "jarvis:voice-prepare-models",
+    "jarvis:voice-arm",
+    "jarvis:voice-begin",
+    "jarvis:voice-end",
+    "jarvis:voice-cancel",
+    "jarvis:tts-stop",
+  ] as const) {
+    const ok = await dispatch(channel, {});
+    assert.equal(ok.ok, true, channel);
+    const undefinedOk = await dispatch(channel, undefined);
+    assert.equal(undefinedOk.ok, true, channel);
+
+    for (const bad of [{ sneaky: "keys" }, [1, 2, 3], "text", 42, null]) {
+      const result = (await dispatch(channel, bad)) as IpcResult<never>;
+      assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", `${channel} ${String(bad)}`);
+    }
+  }
+});
+
+test("tts-speak payload bounds: exact shape, trimmed text, 2000-char ceiling", async () => {
+  const ok = (await dispatch("jarvis:tts-speak", { text: "  status ready  " })) as IpcResult<{
+    payload: { text: string };
+  }>;
+  assert.equal(ok.ok, true);
+  if (ok.ok) assert.equal(ok.data.payload.text, "status ready", "text is trimmed at the wire");
+
+  // Exactly the 2000-char ceiling passes.
+  const atLimit = await dispatch("jarvis:tts-speak", { text: "x".repeat(2000) });
+  assert.equal(atLimit.ok, true, "2000 characters must be accepted");
+
+  for (const bad of [
+    { text: "   " },
+    { text: "" },
+    { text: "x".repeat(2001) },
+    { text: 42 },
+    { text: null },
+    {}, // missing key
+    { text: "hello", voice: "alloy" }, // extra key smuggling
+  ]) {
+    const result = (await dispatch("jarvis:tts-speak", bad)) as IpcResult<never>;
+    assert.equal(result.ok ? null : result.code, "BAD_PAYLOAD", JSON.stringify(bad).slice(0, 40));
+  }
+});
+
+test("voice handler stubs fail closed with honest ENGINE_UNAVAILABLE copy", async () => {
+  // Mirrors handlers.ts behavior: presence of the channels in the registry
+  // (so routing/validators work) while every answer is an explicit
+  // engine-unavailable failure — never a fake status or synthetic audio.
+  const voiceHandlers: IpcHandlers = Object.fromEntries(
+    Object.entries(HANDLERS).map(([channel, handler]) => [
+      channel,
+      channel.startsWith("jarvis:voice-") || channel.startsWith("jarvis:tts-")
+        ? async () => ipcError("ENGINE_UNAVAILABLE", VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"])
+        : handler,
+    ]),
+  ) as IpcHandlers;
+  const registry = createIpcRegistry(voiceHandlers, trusted);
+
+  for (const channel of [
+    "jarvis:voice-status",
+    "jarvis:voice-prepare-models",
+    "jarvis:voice-arm",
+    "jarvis:voice-begin",
+    "jarvis:voice-end",
+    "jarvis:voice-cancel",
+    "jarvis:tts-speak",
+    "jarvis:tts-stop",
+  ] as const) {
+    const payload = channel === "jarvis:tts-speak" ? { text: "hello" } : {};
+    const result = await registry.dispatch(channel, payload, "http://127.0.0.1:5173/");
+    assert.equal(result.ok, false, channel);
+    if (!result.ok) {
+      assert.equal(result.code, "ENGINE_UNAVAILABLE", channel);
+      assert.equal(result.message, VOICE_ERROR_COPY["ENGINE_UNAVAILABLE"], channel);
+    }
+  }
+});
+
+test("the voice event channel is deliberately absent from the registry", async () => {
+  assert.equal(
+    Object.values(IPC_CHANNELS).includes("jarvis:voice-events" as IpcChannel),
+    false,
+    "events are main→renderer only and must never be invokable",
+  );
+  assert.equal(PAYLOAD_VALIDATORS["jarvis:voice-events" as keyof IpcPayloadMap], undefined);
 });

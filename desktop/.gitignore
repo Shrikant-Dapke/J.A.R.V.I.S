@@ -11,3 +11,7 @@ dist-test/
 npm-debug.log*
 .DS_Store
 Thumbs.db
+
+# Downloaded voice models + smoke benchmark report (production artifacts)
+.voice-models/
+.voice-bench.json

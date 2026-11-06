@@ -20,6 +20,12 @@
 /** All IPC channel names start with this prefix. */
 export const IPC_CHANNEL_PREFIX = "jarvis:";
 
+/**
+ * Type-only import (erased at compile time — `shared/voice-engine.ts`
+ * imports runtime values from here, so a runtime edge would be a cycle).
+ */
+import type { VoiceEventPayload } from "./voice-engine";
+
 /** Explicit, exhaustive channel registry. Add new channels here only. */
 export const IPC_CHANNELS = {
   backendStatus: "jarvis:backend-status",
@@ -37,7 +43,30 @@ export const IPC_CHANNELS = {
   getPlan: "jarvis:get-plan",
   requestPlanStep: "jarvis:request-plan-step",
   resolvePlanRecovery: "jarvis:resolve-plan-recovery",
+  // Phase 6.4 voice commands (renderer → main). Handlers arrive with the
+  // speech runtime phase (6.4-b); until then every row returns the honest
+  // ENGINE_UNAVAILABLE failure — no stub audio, no synthetic recognition.
+  voiceStatus: "jarvis:voice-status",
+  voicePrepareModels: "jarvis:voice-prepare-models",
+  voiceArm: "jarvis:voice-arm",
+  voiceBegin: "jarvis:voice-begin",
+  voiceEnd: "jarvis:voice-end",
+  voiceCancel: "jarvis:voice-cancel",
+  ttsSpeak: "jarvis:tts-speak",
+  ttsStop: "jarvis:tts-stop",
+  // Phase 6.4-c microphone feed: renderer audio-capture thread → main
+  // process → voice engine. Bounded mono PCM16 at the fixed 16 kHz rate.
+  voiceFeed: "jarvis:voice-feed",
 } as const;
+
+/**
+ * The single MAIN → RENDERER voice event channel (recognition partials,
+ * TTS audio, state changes). It is deliberately NOT in IPC_CHANNELS:
+ * events are never dispatched renderer→main, so the registry must not
+ * advertise them. The payload contract for this channel lives in
+ * `shared/voice-engine.ts` (validateVoiceEventPayload).
+ */
+export const VOICE_EVENTS_CHANNEL = "jarvis:voice-events";
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];
 
@@ -53,7 +82,21 @@ export type IpcErrorCode =
   | "BACKEND_UNREACHABLE"
   | "TIMEOUT"
   | "HTTP_STATUS"
-  | "UNEXPECTED";
+  | "UNEXPECTED"
+  /** Voice commands before the speech runtime exists (Phase 6.4-b). */
+  | "ENGINE_UNAVAILABLE"
+  /** A voice command issued outside its required state (Phase 6.4-b). */
+  | "VOICE_STATE"
+  /** Voice model files are not installed (Phase 6.4-b; user must prepare). */
+  | "MODEL_MISSING"
+  /** Local speech recognition failed honestly (no fake transcript). */
+  | "STT_FAILURE"
+  /** Local synthesis failed honestly (no synthetic audio). */
+  | "TTS_FAILURE"
+  /** The user cancelled the active capture/synthesis. */
+  | "RECORDING_CANCELLED"
+  /** Microphone permission was denied (explicit, never assumed). */
+  | "MICROPHONE_DENIED";
 
 export type IpcResult<T> =
   | { ok: true; data: T }
@@ -124,6 +167,65 @@ export type PlanStepPayload = {
   planId: string;
   stepId: string;
 };
+
+/**
+ * Voice channel payloads (Phase 6.4-a contracts; the engine that honors
+ * them arrives in 6.4-b). All voice command channels take the canonical
+ * empty payload except `jarvis:tts-speak`.
+ */
+export type VoiceCommandPayload = EmptyPayload;
+
+/** `jarvis:tts-speak` payload — the ONLY voice command carrying text. */
+export type TtsSpeakPayload = {
+  text: string;
+};
+
+/** Bound for TTS text, transcripts (interim + final), and failure notes. */
+export const VOICE_TEXT_MAX_LENGTH = 2000;
+
+/** Bounded failure copy carried by voice events. */
+export const VOICE_FAILURE_MESSAGE_MAX_LENGTH = 512;
+
+/** Fixed capture (STT input) sample rate: 16 kHz mono PCM16 frames. */
+export const VOICE_PCM_SAMPLE_RATE = 16_000;
+
+/**
+ * One streamed TTS chunk is 16 kHz * 2 bytes = 32 000 B/s, so 1 s of
+ * audio is 32 000 bytes; the ceiling admits ~2 s per chunk while keeping
+ * any single IPC message bounded.
+ */
+export const VOICE_PCM_CHUNK_MAX_BYTES = 65_536;
+
+/** Upper bound on streamed TTS chunk sequence numbers. */
+export const VOICE_SEQUENCE_MAX = 1_000_000;
+
+/** Validate `jarvis:tts-speak` (exact single key, trimmed, bounded). */
+export function validateTtsSpeakPayload(
+  value: unknown,
+): PayloadValidation<TtsSpeakPayload> {
+  if (!isPlainObject(value)) {
+    return { ok: false, reason: "TTS payload must be an object." };
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 1 || keys[0] !== "text") {
+    return { ok: false, reason: "TTS payload accepts exactly text." };
+  }
+  const text = (value as { text: unknown }).text;
+  if (typeof text !== "string") {
+    return { ok: false, reason: "TTS text must be a string." };
+  }
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: "TTS text must not be empty." };
+  }
+  if (text.length > VOICE_TEXT_MAX_LENGTH) {
+    return {
+      ok: false,
+      reason: `TTS text exceeds the ${VOICE_TEXT_MAX_LENGTH} character limit.`,
+    };
+  }
+  return { ok: true, value: { text: trimmed } };
+}
 
 /* ------------------------- validation contract --------------------- */
 
@@ -346,6 +448,15 @@ export type IpcPayloadMap = {
   "jarvis:get-plan": PlanIdPayload;
   "jarvis:request-plan-step": PlanStepPayload;
   "jarvis:resolve-plan-recovery": PlanStepPayload;
+  "jarvis:voice-status": VoiceCommandPayload;
+  "jarvis:voice-prepare-models": VoiceCommandPayload;
+  "jarvis:voice-arm": VoiceCommandPayload;
+  "jarvis:voice-begin": VoiceCommandPayload;
+  "jarvis:voice-end": VoiceCommandPayload;
+  "jarvis:voice-cancel": VoiceCommandPayload;
+  "jarvis:voice-feed": VoiceFeedPayload;
+  "jarvis:tts-speak": TtsSpeakPayload;
+  "jarvis:tts-stop": VoiceCommandPayload;
 };
 
 export type PayloadValidator<K extends keyof IpcPayloadMap> = (
@@ -358,7 +469,65 @@ function validateEmptyPayload(value: unknown): PayloadValidation<EmptyPayload> {
     : { ok: false, reason: "This channel accepts an empty payload only." };
 }
 
-export const PAYLOAD_VALIDATORS: {
+/**
+ * `jarvis:voice-feed` payload (Phase 6.4-c). One bounded chunk of
+ * microphone audio: mono PCM16, little-endian, at the fixed
+ * VOICE_PCM_SAMPLE_RATE (16 kHz). The chunk itself never carries a
+ * sample-rate field — the rate is a shared constant, so a lying rate is
+ * impossible by construction. `sequence` strictly increases across the
+ * capture session starting at 0; duplicates/replays are dropped by the
+ * main-process gate (never fed to the recognizer twice).
+ */
+export type VoiceFeedPayload = {
+  sequence: number;
+  pcm: ArrayBuffer;
+};
+
+/**
+ * Renderer capture framing: 3 200 PCM16 samples = 200 ms of 16 kHz
+ * speech per IPC message (6 400 bytes) — batching well above the
+ * per-frame drizzle while keeping end-of-utterance flush latency low.
+ */
+export const VOICE_MIC_CHUNK_SAMPLES = 3_200;
+
+/** Validate `jarvis:voice-feed` (exact key set, bounded PCM16). */
+export function validateVoiceFeedPayload(
+  value: unknown,
+): PayloadValidation<VoiceFeedPayload> {
+  if (!isPlainObject(value)) {
+    return { ok: false, reason: "Voice feed payload must be an object." };
+  }
+  const keys = Object.keys(value).sort();
+  if (keys.length !== 2 || keys[0] !== "pcm" || keys[1] !== "sequence") {
+    return { ok: false, reason: "Voice feed payload accepts exactly pcm and sequence." };
+  }
+  const sequence = (value as { sequence: unknown }).sequence;
+  if (
+    typeof sequence !== "number" ||
+    !Number.isInteger(sequence) ||
+    sequence < 0 ||
+    sequence > VOICE_SEQUENCE_MAX
+  ) {
+    return { ok: false, reason: "Voice feed sequence is out of bounds." };
+  }
+  const pcm = (value as { pcm: unknown }).pcm;
+  if (!(pcm instanceof ArrayBuffer)) {
+    return { ok: false, reason: "Voice feed pcm must be an ArrayBuffer of PCM16 bytes." };
+  }
+  if (
+    pcm.byteLength === 0 ||
+    pcm.byteLength % 2 !== 0 ||
+    pcm.byteLength > VOICE_PCM_CHUNK_MAX_BYTES
+  ) {
+    return {
+      ok: false,
+      reason: `Voice feed pcm must be 2…${VOICE_PCM_CHUNK_MAX_BYTES} bytes (even count).`,
+    };
+  }
+  return { ok: true, value: { sequence, pcm } };
+}
+
+</think><tool_call>edit<arg_key>newString</arg_key><arg_value>export const PAYLOAD_VALIDATORS: {
   [K in keyof IpcPayloadMap]: PayloadValidator<K>;
 } = {
   "jarvis:backend-status": validateEmptyPayload,
@@ -376,6 +545,15 @@ export const PAYLOAD_VALIDATORS: {
   "jarvis:get-plan": validatePlanIdPayload,
   "jarvis:request-plan-step": validatePlanStepPayload,
   "jarvis:resolve-plan-recovery": validatePlanStepPayload,
+  "jarvis:voice-status": validateEmptyPayload,
+  "jarvis:voice-prepare-models": validateEmptyPayload,
+  "jarvis:voice-arm": validateEmptyPayload,
+  "jarvis:voice-begin": validateEmptyPayload,
+  "jarvis:voice-end": validateEmptyPayload,
+  "jarvis:voice-cancel": validateEmptyPayload,
+  "jarvis:voice-feed": validateVoiceFeedPayload,
+  "jarvis:tts-speak": validateTtsSpeakPayload,
+  "jarvis:tts-stop": validateEmptyPayload,
 };
 
 /* ------------------------------------------------------------------ */
@@ -633,6 +811,23 @@ export type PlanListView = {
   total: number;
 };
 
+/**
+ * `jarvis:voice-status` result (Phase 6.4). Everything is a bounded,
+ * boolean-ish availability probe — never paths or model internals.
+ */
+export type VoiceStatusView = {
+  /** Speech runtime loaded and responsive. */
+  engineAvailable: boolean;
+  /** Speech-to-text model files present and verified. */
+  sttModelPresent: boolean;
+  /** Text-to-speech model files present and verified. */
+  ttsModelPresent: boolean;
+  /** Voice-activity-detection model present (optional tier). */
+  vadModelPresent: boolean;
+  /** Bounded human note (e.g. which phase/tooling is missing) — no paths. */
+  message: string;
+};
+
 /** POST .../steps/{step}/request outcome, discriminated exactly like the API (200|202). */
 export type PlanStepRequestOutcomeView =
   | { kind: "executed"; execution: ToolExecutionView }
@@ -674,6 +869,15 @@ export const PRELOAD_METHODS = [
   { method: "getPlan", channel: IPC_CHANNELS.getPlan },
   { method: "requestPlanStep", channel: IPC_CHANNELS.requestPlanStep },
   { method: "resolvePlanRecovery", channel: IPC_CHANNELS.resolvePlanRecovery },
+  { method: "voiceStatus", channel: IPC_CHANNELS.voiceStatus },
+  { method: "voicePrepareModels", channel: IPC_CHANNELS.voicePrepareModels },
+  { method: "voiceArm", channel: IPC_CHANNELS.voiceArm },
+  { method: "voiceBegin", channel: IPC_CHANNELS.voiceBegin },
+  { method: "voiceEnd", channel: IPC_CHANNELS.voiceEnd },
+  { method: "voiceCancel", channel: IPC_CHANNELS.voiceCancel },
+  { method: "voiceFeed", channel: IPC_CHANNELS.voiceFeed },
+  { method: "ttsSpeak", channel: IPC_CHANNELS.ttsSpeak },
+  { method: "ttsStop", channel: IPC_CHANNELS.ttsStop },
 ] as const;
 
 export type PreloadMethodName = (typeof PRELOAD_METHODS)[number]["method"];
@@ -695,6 +899,22 @@ export type JarvisApi = {
   getPlan(payload: PlanIdPayload): Promise<IpcResult<PlanDetailView>>;
   requestPlanStep(payload: PlanStepPayload): Promise<IpcResult<PlanStepRequestOutcomeView>>;
   resolvePlanRecovery(payload: PlanStepPayload): Promise<IpcResult<PlanRecoveryResolvedView>>;
+  voiceStatus(): Promise<IpcResult<VoiceStatusView>>;
+  voicePrepareModels(): Promise<IpcResult<VoiceStatusView>>;
+  voiceArm(): Promise<IpcResult<EmptyPayload>>;
+  voiceBegin(): Promise<IpcResult<EmptyPayload>>;
+  voiceEnd(): Promise<IpcResult<EmptyPayload>>;
+  voiceCancel(): Promise<IpcResult<EmptyPayload>>;
+  ttsSpeak(payload: TtsSpeakPayload): Promise<IpcResult<EmptyPayload>>;
+  ttsStop(): Promise<IpcResult<EmptyPayload>>;
+  voiceFeed(payload: VoiceFeedPayload): Promise<IpcResult<EmptyPayload>>;
+  /**
+   * Subscribe to the single MAIN → RENDERER voice event channel
+   * (state / partial / final / tts-chunk / tts-ended / failure).
+   * The listener receives engine-validated payloads only; the returned
+   * function unsubscribes. Events are never dispatchable renderer→main.
+   */
+  onVoiceEvent(listener: (event: VoiceEventPayload) => void): () => void;
 };
 
 /** Human-readable copy for error codes (renderer-side). */
@@ -707,6 +927,14 @@ export const IPC_ERROR_COPY: Record<IpcErrorCode, string> = {
   TIMEOUT: "The backend did not respond in time.",
   HTTP_STATUS: "The backend returned an error response.",
   UNEXPECTED: "An unexpected error occurred.",
+  ENGINE_UNAVAILABLE:
+    "The voice engine is not available in this build (speech runtime not configured).",
+  VOICE_STATE: "That voice command does not match the current voice state.",
+  MODEL_MISSING: "The local voice models are not installed yet. Prepare them first.",
+  STT_FAILURE: "Local speech recognition failed — no transcript was produced.",
+  TTS_FAILURE: "Local speech synthesis failed — no audio was produced.",
+  RECORDING_CANCELLED: "Cancelled. Nothing was recorded or spoken.",
+  MICROPHONE_DENIED: "Microphone access was not granted.",
 };
 
 /** Chat-specific consequence copy shown under the generic error line. */
