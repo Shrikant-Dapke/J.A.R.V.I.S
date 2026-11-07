@@ -42,7 +42,7 @@ import type { VoiceModelManager } from "./model-manager";
 export type VoiceWorkerTransport = {
   send: (request: WorkerRequest) => void;
   onResponse: (callback: (response: WorkerResponse) => void) => void;
-  onExit: (callback: (info: { exitCode: number | null }) => void) => void;
+  onExit: (callback: (info: { exitCode: number | null; reason?: string }) => void) => void;
   kill: () => void;
   running: () => boolean;
 };
@@ -132,10 +132,16 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
 
   const subscribers = new Set<VoiceEngineEventSubscriber>();
   let transport: VoiceWorkerTransport | null = null;
+  let transportStart: Promise<VoiceWorkerTransport> | null = null;
   /** Which reply the engine currently waits for — strictly single flight. */
   type Awaiting = { kind: "worker-ready" | "init" | "session"; resolve: (value: WorkerResponse | null) => void };
   let awaiting: Awaiting | null = null;
   let awaitingTimer: ReturnType<typeof setTimeout> | null = null;
+  let awaitingFailure: string | null = null;
+  let loadingEngine: "stt" | "tts" | null = null;
+  type InitResult = Extract<WorkerResponse, { type: "init-ok" }> | { error: string; code: VoiceErrorCode };
+  let sttInitInFlight: Promise<InitResult> | null = null;
+  let ttsInitInFlight: Promise<InitResult> | null = null;
   /** The worker knows these legs; set as init-ok confirms them. */
   let session: SessionPhase | null = null;
   /** Identity of the active renderer-owned synthesis request. */
@@ -205,31 +211,95 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
     current?.resolve(value);
   };
 
-  const engineFailureText = (): string => machine.getFailure()?.message ?? "Voice engine failure.";
-
-  const killTransport = (): void => {
-    transport?.kill();
-    transport = null;
+  const takeAwaitingFailure = (): string | null => {
+    const failure = awaitingFailure;
+    awaitingFailure = null;
+    return failure;
   };
 
-  const handleTransportExit = (_info: { exitCode: number | null }): void => {
+  const engineFailureText = (): string => machine.getFailure()?.message ?? "Voice engine failure.";
+
+  const killTransport = (target: VoiceWorkerTransport | null = transport): void => {
+    if (!target) return;
+    if (transport === target) transport = null;
+    target.kill();
+  };
+
+  const handleTransportExit = (
+    exiting: VoiceWorkerTransport,
+    info: { exitCode: number | null; reason?: string },
+  ): void => {
+    if (transport !== exiting) return;
     transport = null;
+    const awaitingKind = awaiting?.kind;
+    const reason = scrubPathsForUi(
+      info.reason ?? `The voice worker exited (code ${info.exitCode ?? "null"}).`,
+    );
+    if (awaitingKind) awaitingFailure = reason;
     settleAwaiting(null);
     const state = machine.getState();
     if (state === "failed" || state === "cancelled" || state === "idle") {
       if (state !== "idle") trace(`[voice] worker exited during ${state}`);
       return;
     }
+    const code: VoiceErrorCode =
+      awaitingKind === "worker-ready"
+        ? "ENGINE_UNAVAILABLE"
+        : loadingEngine === "tts" || state === "speaking"
+          ? "TTS_FAILURE"
+          : "STT_FAILURE";
     failMachine(
-      state === "speaking" ? "TTS_FAILURE" : "STT_FAILURE",
-      "The voice engine worker stopped unexpectedly.",
+      code,
+      awaitingKind === "worker-ready" ? reason : "The voice engine worker stopped unexpectedly.",
     );
   };
 
   const ensureTransport = async (): Promise<VoiceEngineOutcome | { kind: "transport"; transport: VoiceWorkerTransport }> => {
     if (transport) return { kind: "transport", transport };
+    if (!transportStart) {
+      const startPromise = (async (): Promise<VoiceWorkerTransport> => {
+        let created: VoiceWorkerTransport;
+        try {
+          created = await deps.createTransport();
+        } catch (error) {
+          throw new Error(
+            scrubPathsForUi(error instanceof Error ? error.message : String(error)),
+          );
+        }
+
+        transport = created;
+        awaitingFailure = null;
+        const readyPromise = new Promise<WorkerResponse | null>((resolve) => {
+          awaiting = { kind: "worker-ready", resolve };
+          awaitingTimer = setTimeout(() => settleAwaiting(null), spawnTimeout);
+        });
+        created.onExit((info) => handleTransportExit(created, info));
+        created.onResponse(routeResponse);
+        const ready = await readyPromise;
+        const failure = takeAwaitingFailure();
+        if (!ready || ready.type !== "worker-ready") {
+          killTransport(created);
+          const message =
+            failure ??
+            `The voice worker did not become ready within ${spawnTimeout} ms.`;
+          trace(`[voice] ${message}`);
+          throw new Error(message);
+        }
+        return created;
+      })();
+      transportStart = startPromise;
+      void startPromise.then(
+        () => {
+          if (transportStart === startPromise) transportStart = null;
+        },
+        () => {
+          if (transportStart === startPromise) transportStart = null;
+        },
+      );
+    }
     try {
-      transport = await deps.createTransport();
+      const started = await transportStart;
+      return { kind: "transport", transport: started };
     } catch (error) {
       return {
         ok: false,
@@ -237,18 +307,6 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
         message: clamp(error instanceof Error ? error.message : String(error), STATUS_MESSAGE_MAX),
       };
     }
-    transport.onExit(handleTransportExit);
-    transport.onResponse(routeResponse);
-    // Await the beacon once per spawn, bounded.
-    const ready = await new Promise<WorkerResponse | null>((resolve) => {
-      awaiting = { kind: "worker-ready", resolve };
-      awaitingTimer = setTimeout(() => resolve(null), spawnTimeout);
-    });
-    if (!ready || ready.type !== "worker-ready") {
-      killTransport();
-      return { ok: false, code: "ENGINE_UNAVAILABLE", message: "The voice worker did not become ready." };
-    }
-    return { kind: "transport", transport };
   };
 
   const isTransportOk = (
@@ -257,7 +315,6 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
 
   /* ------------------------- response routing --------------------- */
 
-  type InitOk = Extract<WorkerResponse, { type: "init-ok" }>;
   type TtsChunk = Extract<WorkerResponse, { type: "tts-chunk" }>;
   type WorkerError = Extract<WorkerResponse, { type: "worker-error" }>;
 
@@ -363,51 +420,120 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
     if (!t) return null;
     return await new Promise<WorkerResponse | null>((resolve) => {
       session = phase;
+      awaitingFailure = null;
       awaiting = { kind, resolve };
-      awaitingTimer = setTimeout(() => resolve(null), timeoutMs);
+      awaitingTimer = setTimeout(() => settleAwaiting(null), timeoutMs);
       try {
         t.send(request);
       } catch (error) {
-        resolve(null);
-        trace(`[voice] send failed: ${error instanceof Error ? error.message : String(error)}`);
+        const message = scrubPathsForUi(
+          error instanceof Error ? error.message : String(error),
+        );
+        awaitingFailure = message;
+        settleAwaiting(null);
+        trace(`[voice] send failed: ${message}`);
       }
     });
   };
 
-  const loadStt = async (): Promise<InitOk | { error: string }> => {
-    const started = await ensureTransport();
-    if (!isTransportOk(started)) {
-      return { error: started.ok ? "Voice worker failed to start." : started.message };
-    }
-    const models = deps.models.status();
-    if (!models.sttPresent || !models.sttPaths) {
-      return { error: "Speech-to-text model files are missing — prepare the models first." };
-    }
-    const response = await dispatchAwaiting("init", null, { type: "init", stt: models.sttPaths }, initTimeout);
-    if (!response) return { error: "Speech recognition did not initialize in time." };
-    if (response.type === "init-fail" && response.engine === "stt") {
-      return { error: scrubPathsForUi(response.message) };
-    }
-    if (response.type === "init-ok" && response.stt) return response;
-    return { error: "Speech recognition init failed." };
+  const loadStt = (): Promise<InitResult> => {
+    if (sttInitInFlight) return sttInitInFlight;
+    const promise = (async (): Promise<InitResult> => {
+      const started = await ensureTransport();
+      if (!isTransportOk(started)) {
+        return started.ok
+          ? { error: "The voice worker failed to start.", code: "ENGINE_UNAVAILABLE" }
+          : { error: started.message, code: started.code as VoiceErrorCode };
+      }
+      const models = deps.models.status();
+      if (!models.sttPresent || !models.sttPaths) {
+        return {
+          error: "Speech-to-text model files are missing — prepare the models first.",
+          code: "MODEL_MISSING",
+        };
+      }
+      loadingEngine = "stt";
+      const response = await dispatchAwaiting(
+        "init",
+        null,
+        { type: "init", stt: models.sttPaths },
+        initTimeout,
+      );
+      loadingEngine = null;
+      if (!response) {
+        return {
+          error:
+            takeAwaitingFailure() ??
+            `Speech recognition did not initialize within ${initTimeout} ms.`,
+          code: "STT_FAILURE",
+        };
+      }
+      if (response.type === "init-fail" && response.engine === "stt") {
+        return { error: scrubPathsForUi(response.message), code: "STT_FAILURE" };
+      }
+      if (response.type === "init-ok" && response.stt) return response;
+      return { error: "Speech recognition initialization returned an invalid result.", code: "STT_FAILURE" };
+    })();
+    sttInitInFlight = promise;
+    void promise.then(
+      () => {
+        if (sttInitInFlight === promise) sttInitInFlight = null;
+      },
+      () => {
+        if (sttInitInFlight === promise) sttInitInFlight = null;
+      },
+    );
+    return promise;
   };
 
-  const loadTts = async (): Promise<InitOk | { error: string }> => {
-    const started = await ensureTransport();
-    if (!isTransportOk(started)) {
-      return { error: started.ok ? "Voice worker failed to start." : started.message };
-    }
-    const models = deps.models.status();
-    if (!models.ttsPresent || !models.ttsPaths) {
-      return { error: "Text-to-speech model files are missing — prepare the models first." };
-    }
-    const response = await dispatchAwaiting("init", null, { type: "init", tts: models.ttsPaths }, initTimeout);
-    if (!response) return { error: "Speech synthesis did not initialize in time." };
-    if (response.type === "init-fail" && response.engine === "tts") {
-      return { error: scrubPathsForUi(response.message) };
-    }
-    if (response.type === "init-ok" && response.tts) return response;
-    return { error: "Speech synthesis init failed." };
+  const loadTts = (): Promise<InitResult> => {
+    if (ttsInitInFlight) return ttsInitInFlight;
+    const promise = (async (): Promise<InitResult> => {
+      const started = await ensureTransport();
+      if (!isTransportOk(started)) {
+        return started.ok
+          ? { error: "The voice worker failed to start.", code: "ENGINE_UNAVAILABLE" }
+          : { error: started.message, code: started.code as VoiceErrorCode };
+      }
+      const models = deps.models.status();
+      if (!models.ttsPresent || !models.ttsPaths) {
+        return {
+          error: "Text-to-speech model files are missing — prepare the models first.",
+          code: "MODEL_MISSING",
+        };
+      }
+      loadingEngine = "tts";
+      const response = await dispatchAwaiting(
+        "init",
+        null,
+        { type: "init", tts: models.ttsPaths },
+        initTimeout,
+      );
+      loadingEngine = null;
+      if (!response) {
+        return {
+          error:
+            takeAwaitingFailure() ??
+            `Speech synthesis did not initialize within ${initTimeout} ms.`,
+          code: "TTS_FAILURE",
+        };
+      }
+      if (response.type === "init-fail" && response.engine === "tts") {
+        return { error: scrubPathsForUi(response.message), code: "TTS_FAILURE" };
+      }
+      if (response.type === "init-ok" && response.tts) return response;
+      return { error: "Speech synthesis initialization returned an invalid result.", code: "TTS_FAILURE" };
+    })();
+    ttsInitInFlight = promise;
+    void promise.then(
+      () => {
+        if (ttsInitInFlight === promise) ttsInitInFlight = null;
+      },
+      () => {
+        if (ttsInitInFlight === promise) ttsInitInFlight = null;
+      },
+    );
+    return promise;
   };
 
   const arm = async (): Promise<VoiceEngineOutcome> => {
@@ -424,8 +550,8 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
     if (guard) return guard;
     const init = await loadStt();
     if ("error" in init) {
-      failMachine("MODEL_MISSING", init.error);
-      return { ok: false, code: "MODEL_MISSING", message: init.error };
+      failMachine(init.code, init.error);
+      return { ok: false, code: init.code, message: init.error };
     }
     // Opening the stream is fire-and-forget (the worker answers only in
     // failure): apply the legal transition first — a late worker-error
@@ -551,10 +677,9 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
           message: "Speech playback was cancelled.",
         };
       }
-      const missing = init.error.includes("missing");
-      failMachine(missing ? "MODEL_MISSING" : "TTS_FAILURE", init.error);
+      failMachine(init.code, init.error);
       speakingRequestId = null;
-      return { ok: false, code: missing ? "MODEL_MISSING" : "TTS_FAILURE", message: init.error };
+      return { ok: false, code: init.code, message: init.error };
     }
     const ended = await dispatchAwaiting(
       "session",

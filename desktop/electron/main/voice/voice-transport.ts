@@ -28,14 +28,20 @@ const SPAWN_TIMEOUT_MS = 10_000;
  * only happens when the engine first needs native inference.
  */
 export function createUtilityProcessTransportFactory(
-  workerScriptPath: string = join(__dirname, "voice-worker.js"),
+  workerScriptPath: string = join(__dirname, "voice-worker-entry.js"),
 ): TransportFactory {
   return () =>
     new Promise<VoiceWorkerTransport>((resolve, reject) => {
       const responseCallbacks = new Set<(response: WorkerResponse) => void>();
-      const exitCallbacks = new Set<(info: { exitCode: number | null }) => void>();
+      const exitCallbacks = new Set<
+        (info: { exitCode: number | null; reason?: string }) => void
+      >();
+      const bufferedResponses: unknown[] = [];
+      const maxBufferedResponses = 16;
       let running = true;
       let child: UtilityProcess;
+      let terminalInfo: { exitCode: number | null; reason?: string } | null = null;
+      let suppressExit = false;
 
       try {
         child = utilityProcess.fork(workerScriptPath, [], {
@@ -56,6 +62,24 @@ export function createUtilityProcessTransportFactory(
         if (settled) return;
         settled = true;
         resolve(value);
+      };
+
+      const notifyExit = (info: { exitCode: number | null; reason?: string }): void => {
+        if (terminalInfo) return;
+        terminalInfo = info;
+        running = false;
+        clearTimeout(spawnGuard);
+        if (!settled) {
+          onceFailed(
+            new Error(
+              info.reason ??
+                `The voice worker exited before it became available (code ${info.exitCode ?? "null"}).`,
+            ),
+          );
+          return;
+        }
+        if (suppressExit) return;
+        for (const callback of exitCallbacks) callback(info);
       };
 
       const spawnGuard = setTimeout(() => {
@@ -82,12 +106,16 @@ export function createUtilityProcessTransportFactory(
           },
           onResponse: (callback) => {
             responseCallbacks.add(callback);
+            const buffered = bufferedResponses.splice(0);
+            for (const response of buffered) callback(response as WorkerResponse);
           },
           onExit: (callback) => {
             exitCallbacks.add(callback);
+            if (terminalInfo && !suppressExit) callback(terminalInfo);
           },
           kill: () => {
             running = false;
+            suppressExit = true;
             try {
               child.kill();
             } catch {
@@ -99,17 +127,24 @@ export function createUtilityProcessTransportFactory(
       });
       child.on("message", (raw: unknown) => {
         if (!running) return;
+        if (responseCallbacks.size === 0) {
+          if (bufferedResponses.length < maxBufferedResponses) bufferedResponses.push(raw);
+          return;
+        }
         for (const callback of responseCallbacks) callback(raw as WorkerResponse);
       });
 
-      child.on("exit", (exitCode: number | null) => {
-        running = false;
-        clearTimeout(spawnGuard);
-        if (!settled) {
-          onceFailed(new Error(`The voice worker exited before it spawned (code ${exitCode ?? "null"}).`));
-          return;
-        }
-        for (const callback of exitCallbacks) callback({ exitCode });
+      child.once("error", (error) => {
+        notifyExit({
+          exitCode: null,
+          reason: `The voice worker process failed to start: ${String(error)}`,
+        });
+      });
+      child.once("exit", (exitCode: number | null) => {
+        notifyExit({
+          exitCode,
+          reason: `The voice worker exited before it became ready (code ${exitCode ?? "null"}).`,
+        });
       });
     });
 }

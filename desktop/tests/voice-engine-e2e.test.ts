@@ -118,19 +118,41 @@ const fakeNativeModule = {
 /* Harness: real worker + real engine over an in-memory transport         */
 /* ---------------------------------------------------------------------- */
 
-function createHarness(options: { ttsPresent?: boolean } = {}): { engine: ReturnType<typeof createVoiceEngine>; events: VoiceEventPayload[]; spawnCount: () => number } {
+type HarnessOptions = {
+  sttPresent?: boolean;
+  ttsPresent?: boolean;
+  transportMode?: "ready" | "timeout" | "crash-before-ready";
+  spawnTimeoutMs?: number;
+};
+
+function createHarness(options: HarnessOptions = {}): {
+  engine: ReturnType<typeof createVoiceEngine>;
+  events: VoiceEventPayload[];
+  spawnCount: () => number;
+  crashWorker: () => void;
+} {
   const events: VoiceEventPayload[] = [];
   let spawned = 0;
+  let crashCurrentWorker = (): void => undefined;
+  const transportMode = options.transportMode ?? "ready";
 
   const factory = (): Promise<VoiceWorkerTransport> =>
     new Promise((resolve) => {
       spawned += 1;
       const handlers = new Set<(response: unknown) => void>();
-      const exitHandlers = new Set<(info: { exitCode: number | null }) => void>();
+      const exitHandlers = new Set<(info: { exitCode: number | null; reason?: string }) => void>();
       let queuedResponses: unknown[] = [];
       let killed = false;
       let flushScheduled = false;
       let requestHandler: ((request: unknown) => void) | null = null;
+
+      crashCurrentWorker = () => {
+        if (killed) return;
+        killed = true;
+        for (const exit of exitHandlers) {
+          exit({ exitCode: 17, reason: "The fake voice worker crashed unexpectedly." });
+        }
+      };
 
       const flush = (): void => {
         flushScheduled = false;
@@ -161,7 +183,7 @@ function createHarness(options: { ttsPresent?: boolean } = {}): { engine: Return
           requestHandler = onRequest as (request: unknown) => void;
         },
       };
-      startVoiceWorker(host, fakeNativeModule);
+      if (transportMode === "ready") startVoiceWorker(host, fakeNativeModule);
 
       resolve({
         send: (request) => {
@@ -180,26 +202,37 @@ function createHarness(options: { ttsPresent?: boolean } = {}): { engine: Return
         kill: () => {
           if (killed) return;
           killed = true;
-          for (const exit of exitHandlers) exit({ exitCode: 1 });
+          for (const exit of exitHandlers) exit({ exitCode: 1, reason: "The fake voice worker was stopped." });
         },
         running: () => !killed,
       });
+
+      if (transportMode === "crash-before-ready") {
+        setTimeout(() => {
+          if (killed) return;
+          killed = true;
+          for (const exit of exitHandlers) {
+            exit({ exitCode: 17, reason: "The fake voice worker crashed before readiness." });
+          }
+        }, 0);
+      }
     });
 
   // Path objects are exact-keyed by the protocol validators — insertion
   // order must be sorted, exactly like the real model manager produces.
   const sttPaths = { decoder: "d.onnx", encoder: "e.onnx", joiner: "j.onnx", tokens: "t.txt" };
   const ttsPaths = { dataDir: "d", lexicon: "l", model: "m.onnx", tokens: "t.txt", voices: "v.bin" };
+  const sttPresent = options.sttPresent ?? true;
   const ttsPresent = options.ttsPresent ?? true;
   const models: VoiceModelManager = {
     baseDir: "C:\\fake\\models",
     smokePaths: () => ({ wavsDir: null, transTxt: null, missingAssets: [] }),
     status: () => ({
-      sttPresent: true,
+      sttPresent,
       ttsPresent,
-      sttMissing: [],
+      sttMissing: sttPresent ? [] : ["stt/encoder.onnx"],
       ttsMissing: [],
-      sttPaths,
+      sttPaths: sttPresent ? sttPaths : null,
       ttsPaths: ttsPresent ? ttsPaths : null,
     }),
     prepareModels: async () => ({ ok: true, downloaded: 0, verifiedFromCache: 0, bytes: 0 }),
@@ -209,7 +242,7 @@ function createHarness(options: { ttsPresent?: boolean } = {}): { engine: Return
   const engine = createVoiceEngine({
     models,
     createTransport: factory,
-    spawnTimeoutMs: 2_000,
+    spawnTimeoutMs: options.spawnTimeoutMs ?? 2_000,
     initTimeoutMs: 5_000,
     streamTimeoutMs: 2_000,
   });
@@ -220,7 +253,7 @@ function createHarness(options: { ttsPresent?: boolean } = {}): { engine: Return
     assert.equal(validated.ok, true, `${event.kind}: ${validated.ok ? "" : validated.reason}`);
     events.push(validated.value);
   });
-  return { engine, events, spawnCount: () => spawned };
+  return { engine, events, spawnCount: () => spawned, crashWorker: () => crashCurrentWorker() };
 }
 
 /* ---------------------------------------------------------------------- */
@@ -254,6 +287,42 @@ test("full capture flow: arm → begin → feed → end with real worker semanti
   assert.ok(kinds.includes("final"), "final event emitted");
   const finalEvent = events.find((event): event is Extract<VoiceEventPayload, { kind: "final" }> => event.kind === "final");
   assert.equal(finalEvent?.transcript, "the quarterly report is ready");
+});
+
+test("worker startup timeout is bounded and reports ENGINE_UNAVAILABLE", async () => {
+  const { engine } = createHarness({ transportMode: "timeout", spawnTimeoutMs: 20 });
+  await engine.arm();
+  const result = await engine.begin();
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, "ENGINE_UNAVAILABLE");
+    assert.match(result.message, /did not become ready within 20 ms/u);
+  }
+  assert.equal(engine.state(), "failed");
+  assert.equal(engine.failure()?.code, "ENGINE_UNAVAILABLE");
+});
+
+test("worker crash before readiness propagates the crash reason and can recover", async () => {
+  const { engine } = createHarness({ transportMode: "crash-before-ready", spawnTimeoutMs: 200 });
+  await engine.arm();
+  const result = await engine.begin();
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, "ENGINE_UNAVAILABLE");
+    assert.match(result.message, /crashed before readiness/u);
+  }
+  assert.equal(engine.failure()?.code, "ENGINE_UNAVAILABLE");
+  assert.equal((await engine.arm()).ok, true, "failed startup is acknowledged before retry");
+});
+
+test("concurrent first-use initialization creates one worker and one init flight", async () => {
+  const { engine, spawnCount } = createHarness();
+  await engine.arm();
+  const [first, second] = await Promise.all([engine.begin(), engine.begin()]);
+  assert.equal(spawnCount(), 1, "concurrent begin calls share one worker");
+  assert.equal([first.ok, second.ok].filter(Boolean).length, 1, "only one capture transition wins");
+  assert.equal(engine.state(), "listening");
+  engine.cancel();
 });
 
 test("interim text only re-emits when the transcript CHANGES", async () => {
@@ -291,7 +360,7 @@ test("unavailable native runtime → honest failure → arm resets and recovers"
   const begin = await engine.begin();
   assert.equal(begin.ok, false);
   if (!begin.ok) {
-    assert.equal(begin.code, "MODEL_MISSING");
+    assert.equal(begin.code, "STT_FAILURE");
     assert.match(begin.message, /fake native failure/u);
   }
   assert.equal(engine.state(), "failed");
@@ -305,12 +374,12 @@ test("unavailable native runtime → honest failure → arm resets and recovers"
 
 test("worker crash during listening fails the session; next arm respawns it", async () => {
   nativeControl.recognizerTranscript = "the quarterly report is ready"; // don't inherit a prior test's empty transcript
-  const { engine, spawnCount } = createHarness();
+  const { engine, spawnCount, crashWorker } = createHarness();
   await engine.arm();
   assert.equal((await engine.begin()).ok, true);
   assert.equal(engine.state(), "listening");
 
-  engine.dispose(); // kills the live transport → the engine sees an exit
+  crashWorker();
   const feed = engine.feed(new Float32Array(64));
   assert.equal(feed.ok, false, "audio into a dead worker is refused honestly");
   assert.equal(engine.state(), "failed");
@@ -402,6 +471,18 @@ test("missing TTS model files fail honestly before native synthesis", async () =
   if (!outcome.ok) assert.equal(outcome.code, "MODEL_MISSING");
   assert.equal(engine.state(), "failed");
   assert.equal(events.some((event) => event.kind === "tts-chunk"), false);
+});
+
+test("missing STT model files fail before starting native recognition", async () => {
+  const { engine } = createHarness({ sttPresent: false });
+  await engine.arm();
+  const result = await engine.begin();
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.code, "MODEL_MISSING");
+    assert.match(result.message, /Speech-to-text model files are missing/u);
+  }
+  assert.equal(engine.state(), "failed");
 });
 
 test("TTS synthesis failure is propagated without a success event", async () => {

@@ -7,9 +7,9 @@
  * chunked PCM out — with the sample rate ALWAYS reported by the model,
  * never assumed).
  *
- * This module is deliberately Electron-free: it runs as the entry point
- * of an Electron `utilityProcess` (wired via `voice-transport.ts`) and
- * can equally run in a plain Node process for the smoke benchmark.
+ * This module is deliberately Electron-free: `voice-worker-entry.ts` wires
+ * it into an Electron `utilityProcess`, and it can equally run in a plain
+ * Node process for the smoke benchmark.
  *
  * Failure honesty: every reply is structured, key-exact, and bounded
  * (validates through shared/voice-protocol.ts); a native constructor
