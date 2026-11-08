@@ -39,6 +39,8 @@ function voiceStateLabel(state: MicCaptureState, failure: MicFailure | null): st
         return "Voice models unavailable";
       case "STT_FAILURE":
         return "Recognition failed";
+      case "SILENT_INPUT":
+        return "No microphone signal";
       default:
         return "Microphone failed";
     }

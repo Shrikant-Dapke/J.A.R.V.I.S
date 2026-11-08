@@ -5,7 +5,7 @@
  * HuggingFace resolve URL (frozen at the recorded commit), the exact
  * byte size, and the SHA-256 the model manager verifies BEFORE the file
  * is accepted (downloaded to a temp file, hashed, then atomically
- * renamed). Smoke-test assets (LibriSpeech test wavs with ground-truth
+ * renamed). Smoke-test assets (bundled test wavs with ground-truth
  * transcripts) are kept in `smokeFiles` and are never required to run
  * the engine.
  */
@@ -29,22 +29,22 @@ export type PinnedModel = {
   smokeFiles: PinnedModelFile[];
 };
 
-/* STT_ZIPFORMER_EN_INT8 — pinned at HuggingFace commit 672fbf1b30579d6585301139bb363f42a0ad4a24. */
+/* STT_ZIPFORMER_EN_INT8 — pinned at HuggingFace commit 9a65b6ea94c311ca770c2bf895b30f456a22d703. */
 export const STT_ZIPFORMER_EN_INT8: PinnedModel = {
-  id: "stt-zipformer-en-2023-06-26-int8",
-  repo: "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26",
-  commit: "672fbf1b30579d6585301139bb363f42a0ad4a24",
+  id: "stt-zipformer-en-2023-06-21-int8",
+  repo: "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21",
+  commit: "9a65b6ea94c311ca770c2bf895b30f456a22d703",
   files: [
-    { path: "decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx", size: 1307236, sha256: "98da299f471e38bb4e1a8df579b8cc9122d6039576a77e357b3c60f17dd83b02" },
-    { path: "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx", size: 71083163, sha256: "563fde436d16cf7607cf408cd6b30909819d03162652ef389c2450ced3f45ac1" },
-    { path: "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx", size: 259335, sha256: "d944208d660d67c8d72cd2acaeac971fa5ceb8c80e76c1968148846fedd6e297" },
-    { path: "tokens.txt", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/tokens.txt", size: 5048, sha256: "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb" },
+    { path: "decoder-epoch-99-avg-1.int8.onnx", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/decoder-epoch-99-avg-1.int8.onnx", size: 539246, sha256: "093e23c90869898f761f60aa3363f96d43b9c6e5c06a57860c3a5b3407ab8320" },
+    { path: "encoder-epoch-99-avg-1.int8.onnx", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/encoder-epoch-99-avg-1.int8.onnx", size: 187823992, sha256: "32c98281c7bd8b63e3e142d007251b37f120572e8fdea9a4f5a79ce22b10ec4f" },
+    { path: "joiner-epoch-99-avg-1.int8.onnx", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/joiner-epoch-99-avg-1.int8.onnx", size: 259335, sha256: "831477d390e59a61f1b6a6f763b9903e6c6366ff6034f1ddba613be82637122f" },
+    { path: "tokens.txt", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/tokens.txt", size: 5048, sha256: "49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb" },
   ],
   smokeFiles: [
-    { path: "test_wavs/0.wav", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/test_wavs/0.wav", size: 212044, sha256: "6bc58a4efdf20daac252b6b1502632601a71efe0308f6757dc1eda34891a7e4f" },
-    { path: "test_wavs/1.wav", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/test_wavs/1.wav", size: 534924, sha256: "5143a6ba93c4b274e2c4ac22deb75c2c48936c853f0519add1de828b6c79cc5a" },
-    { path: "test_wavs/8k.wav", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/test_wavs/8k.wav", size: 77244, sha256: "f6f3c8b33e2534cdc154fe773ad2750f1f6a2ca5096179cdf037ae782456613e" },
-    { path: "test_wavs/trans.txt", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26/resolve/672fbf1b30579d6585301139bb363f42a0ad4a24/test_wavs/trans.txt", size: 449, sha256: "b9ac44e7b794abb1a2d5faf0005e98a665971e7ac2ed15435832cc34edaa9100" },
+    { path: "test_wavs/0.wav", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/test_wavs/0.wav", size: 212044, sha256: "6bc58a4efdf20daac252b6b1502632601a71efe0308f6757dc1eda34891a7e4f" },
+    { path: "test_wavs/1.wav", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/test_wavs/1.wav", size: 534924, sha256: "5143a6ba93c4b274e2c4ac22deb75c2c48936c853f0519add1de828b6c79cc5a" },
+    { path: "test_wavs/8k.wav", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/test_wavs/8k.wav", size: 77244, sha256: "f6f3c8b33e2534cdc154fe773ad2750f1f6a2ca5096179cdf037ae782456613e" },
+    { path: "test_wavs/trans.txt", url: "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21/resolve/9a65b6ea94c311ca770c2bf895b30f456a22d703/test_wavs/trans.txt", size: 449, sha256: "b9ac44e7b794abb1a2d5faf0005e98a665971e7ac2ed15435832cc34edaa9100" },
   ],
 };
 
@@ -424,4 +424,4 @@ export const TTS_KOKORO_V11_INT8: PinnedModel = {
   ],
 };
 
-export const MODEL_TIMESTAMPS = { generatedInIso: "2026-11-05T06:45:44.488Z" } as const;
+export const MODEL_TIMESTAMPS = { generatedInIso: "2026-11-08T07:55:57.148Z" } as const;

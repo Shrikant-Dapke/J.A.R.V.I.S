@@ -18,15 +18,19 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 const HF_API = "https://huggingface.co/api/models";
-const STT_REPO = "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-26";
+// STT: streaming zipformer trained on LibriSpeech AND GigaSpeech (10k h,
+// podcasts/YouTube/audiobooks) — the English streaming upgrade of the
+// original LibriSpeech-only 2023-06-26 pin (root cause of the physical
+// conversational STT failures). Same zipformer2 OnlineRecognizer family.
+const STT_REPO = "csukuangfj/sherpa-onnx-streaming-zipformer-en-2023-06-21";
 const TTS_REPO = "csukuangfj/kokoro-int8-multi-lang-v1_1";
 
 /** Files we intentionally snapshot (never the .py/.sh/.gitattributes). */
 const STT_FILES = new Set([
   "tokens.txt",
-  "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
-  "decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
-  "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx",
+  "encoder-epoch-99-avg-1.int8.onnx",
+  "decoder-epoch-99-avg-1.int8.onnx",
+  "joiner-epoch-99-avg-1.int8.onnx",
   "test_wavs/0.wav",
   "test_wavs/1.wav",
   "test_wavs/8k.wav",
@@ -154,7 +158,7 @@ const header = `/**
  * HuggingFace resolve URL (frozen at the recorded commit), the exact
  * byte size, and the SHA-256 the model manager verifies BEFORE the file
  * is accepted (downloaded to a temp file, hashed, then atomically
- * renamed). Smoke-test assets (LibriSpeech test wavs with ground-truth
+ * renamed). Smoke-test assets (bundled test wavs with ground-truth
  * transcripts) are kept in \`smokeFiles\` and are never required to run
  * the engine.
  */
@@ -182,7 +186,7 @@ const types = [
 ];
 
 const lines = [header, ...types];
-emit("STT_ZIPFORMER_EN_INT8", "stt-zipformer-en-2023-06-26-int8", sttData, lines);
+emit("STT_ZIPFORMER_EN_INT8", "stt-zipformer-en-2023-06-21-int8", sttData, lines);
 emit("TTS_KOKORO_V11_INT8", "tts-kokoro-multi-lang-v1_1-int8", ttsData, lines);
 lines.push(`\nexport const MODEL_TIMESTAMPS = { generatedInIso: ${JSON.stringify(new Date().toISOString())} } as const;\n`);
 

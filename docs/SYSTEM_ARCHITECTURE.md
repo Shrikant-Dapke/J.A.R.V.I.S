@@ -33,7 +33,9 @@ Versions and provider choices are pinned during implementation planning.
 6. **Policy/Approval Manager:** checks permissions and binds approval to exact arguments.
 7. **Execution Layer:** invokes narrow tools with bounded privileges.
 8. **Verification Layer:** checks postconditions independently.
-9. **Memory/Storage:** SQLite settings, conversations, approved memory, audit events.
+9. **Memory/Storage:** a single local SQLite state DB — conversations,
+   plans, approvals, attempts, and audit events (durable across restarts;
+   never contains secrets).
 
 ## 3. Request lifecycle
 1. UI submits request to local API (authentication and origin checks run first).
@@ -105,8 +107,6 @@ Versions and provider choices are pinned during implementation planning.
 - `POST /api/approvals/{approval_id}/approve` — approve and execute the
   exact pending request once.
 - `POST /api/approvals/{approval_id}/reject` — reject a pending request.
-- `GET /api/memory` — inspect approved memory.
-- `DELETE /api/memory/{id}` — delete memory item.
 - `GET /api/plans` — the session's plan inventory: metadata summaries plus
   attention flags (status_counts, awaiting_approval, recovery_required,
   needs_attention), deterministic `created_at DESC, plan_id DESC` ordering,

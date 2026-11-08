@@ -11,6 +11,9 @@ import {
   Pcm16Chunker,
   StreamingPcmResampler,
 } from "../../../shared/voice-audio";
+import { createMountedGuard } from "../../../shared/mounted-guard";
+import { createVoiceCommandQueue } from "../../../shared/voice-command-queue";
+import { MIC_AUDIO_CONSTRAINTS, MIC_CAPTURE_VIDEO } from "../../../shared/mic-capture-constraints";
 import {
   subscribeVoiceEvents,
   voiceArm,
@@ -36,6 +39,7 @@ export type MicFailureKind =
   | "ENGINE_UNAVAILABLE"
   | "MODEL_MISSING"
   | "STT_FAILURE"
+  | "SILENT_INPUT"
   | "RECORDING_CANCELLED"
   | "CAPTURE_FAILURE";
 
@@ -70,11 +74,21 @@ type CaptureResources = {
   resampler: StreamingPcmResampler;
   chunker: Pcm16Chunker;
   onTrackEnded: () => void;
+  inputBlocks: number;
+  inputSamples: number;
+  peak: number;
 };
 
 type CaptureMode = "idle" | "active" | "ending" | "cancelled" | "failed";
 
 const MAX_PENDING_FEEDS = 3;
+const SILENT_INPUT_PEAK = 0.0001;
+
+function micTrace(message: string, details?: Record<string, unknown>): void {
+  // Diagnostics contain only bounded metadata and never PCM or transcript text.
+  if (details) console.info(`[voice][mic] ${message}`, details);
+  else console.info(`[voice][mic] ${message}`);
+}
 
 function disposeCaptureResources(resources: CaptureResources | null): void {
   if (!resources) return;
@@ -200,7 +214,7 @@ export function useMicCapture({
   const [failure, setFailure] = useState<MicFailure | null>(null);
   const [preparing, setPreparing] = useState(false);
 
-  const mountedRef = useRef(true);
+  const mountedRef = useRef(createMountedGuard());
   const modeRef = useRef<CaptureMode>("idle");
   const sessionRef = useRef(0);
   const resourcesRef = useRef<CaptureResources | null>(null);
@@ -209,6 +223,8 @@ export function useMicCapture({
   const sequenceRef = useRef(0);
   const finalHandledRef = useRef(false);
   const engineActiveRef = useRef(false);
+  const pendingContextRef = useRef<AudioContext | null>(null);
+  const commandQueueRef = useRef(createVoiceCommandQueue());
   const onTranscriptReadyRef = useRef(onTranscriptReady);
 
   useEffect(() => {
@@ -216,13 +232,18 @@ export function useMicCapture({
   }, [onTranscriptReady]);
 
   const setState = useCallback((next: MicCaptureState): void => {
-    if (mountedRef.current) setStateValue(next);
+    if (mountedRef.current.isMounted()) setStateValue(next);
   }, []);
 
   const disposeCurrentResources = useCallback((): CaptureResources | null => {
     const resources = resourcesRef.current;
     resourcesRef.current = null;
     disposeCaptureResources(resources);
+    const pendingContext = pendingContextRef.current;
+    pendingContextRef.current = null;
+    if (pendingContext && pendingContext !== resources?.context) {
+      void pendingContext.close().catch(() => undefined);
+    }
     return resources;
   }, []);
 
@@ -230,7 +251,12 @@ export function useMicCapture({
     if (!engineActiveRef.current) return;
     engineActiveRef.current = false;
     try {
-      await voiceCancel();
+      await commandQueueRef.current.run(async () => {
+        const result = await voiceCancel();
+        if (!result.ok && result.code !== "VOICE_STATE") {
+          micTrace("cancel failed", { code: result.code });
+        }
+      });
     } catch {
       // Local cleanup and the visible failure remain authoritative.
     }
@@ -282,6 +308,9 @@ export function useMicCapture({
           if (!result.ok) throw classifyIpcFailure(result.code, result.message);
         })
         .catch((error: unknown) => {
+          micTrace("feed failed", {
+            kind: error && typeof error === "object" && "kind" in error ? (error as MicFailure).kind : "unknown",
+          });
           if (sessionRef.current === sessionId && modeRef.current !== "cancelled" && modeRef.current !== "failed") {
             void failSession(
               sessionId,
@@ -321,6 +350,17 @@ export function useMicCapture({
         return;
       }
       try {
+        resources.inputBlocks += 1;
+        resources.inputSamples += channels[0]?.length ?? 0;
+        for (const channel of channels) {
+          for (const sample of channel) resources.peak = Math.max(resources.peak, Math.abs(sample));
+        }
+        if (resources.inputBlocks === 1) {
+          micTrace("first audio block", {
+            samples: channels[0]?.length ?? 0,
+            peak: resources.peak,
+          });
+        }
         pushSamples(sessionId, resources, resources.resampler.push(mixToMono(channels)));
       } catch (error) {
         void failSession(sessionId, classifyCaptureError(error));
@@ -344,17 +384,32 @@ export function useMicCapture({
     setTranscript("");
     setState("requesting_permission");
 
+    let context: AudioContext;
+    try {
+      // Construct and resume synchronously from the microphone button's user
+      // activation. Waiting for getUserMedia()/addModule() first can leave a
+      // Chromium AudioContext suspended, which means the worklet never runs.
+      context = new AudioContext({ latencyHint: "interactive" });
+      pendingContextRef.current = context;
+      void context.resume().catch((error: unknown) => {
+        micTrace("initial AudioContext.resume failed", { message: errorMessage(error) });
+      });
+      micTrace("AudioContext created", { sampleRate: context.sampleRate, state: context.state });
+    } catch (error) {
+      void failSession(sessionId, {
+        kind: "CAPTURE_FAILURE",
+        message: `Audio input could not be initialized: ${errorMessage(error)}`,
+      });
+      return;
+    }
+
     void (async () => {
       let stream: MediaStream | null = null;
-      let pendingContext: AudioContext | null = null;
       try {
+        micTrace("requesting microphone");
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-          },
-          video: false,
+          audio: { ...MIC_AUDIO_CONSTRAINTS },
+          video: MIC_CAPTURE_VIDEO,
         });
         if (sessionRef.current !== sessionId || modeRef.current !== "active") {
           for (const track of stream.getTracks()) track.stop();
@@ -364,19 +419,13 @@ export function useMicCapture({
         const track = stream.getAudioTracks()[0];
         if (!track) throw new Error("The microphone stream did not contain an audio track.");
         const settings = track.getSettings();
-        const contextOptions: AudioContextOptions = { latencyHint: "interactive" };
-        if (typeof settings.sampleRate === "number" && settings.sampleRate > 0) {
-          contextOptions.sampleRate = settings.sampleRate;
-        }
-
-        let context: AudioContext;
-        try {
-          context = new AudioContext(contextOptions);
-        } catch {
-          context = new AudioContext({ latencyHint: "interactive" });
-        }
-        pendingContext = context;
+        micTrace("microphone granted", {
+          sampleRate: settings.sampleRate ?? null,
+          channelCount: settings.channelCount ?? null,
+          contextRate: context.sampleRate,
+        });
         await context.audioWorklet.addModule(workletUrl());
+        micTrace("AudioWorklet module loaded", { contextState: context.state });
 
         const source = context.createMediaStreamSource(stream);
         const worklet = new AudioWorkletNode(context, "jarvis-mic-tap", {
@@ -396,6 +445,9 @@ export function useMicCapture({
           resampler: new StreamingPcmResampler(context.sampleRate),
           chunker: new Pcm16Chunker(VOICE_MIC_CHUNK_SAMPLES),
           onTrackEnded: () => undefined,
+          inputBlocks: 0,
+          inputSamples: 0,
+          peak: 0,
         };
         resources.onTrackEnded = () => {
           if (sessionRef.current === sessionId && modeRef.current === "active") {
@@ -415,16 +467,29 @@ export function useMicCapture({
           });
         };
         resourcesRef.current = resources;
-        pendingContext = null;
+        pendingContextRef.current = null;
         // Resume while still inside the explicit user-activation flow;
         // the graph remains disconnected until the engine is ready.
         await context.resume();
+        if (context.state !== "running") {
+          throw new Error(`Audio input context is ${context.state}; microphone processing cannot start.`);
+        }
 
-        const armed = await voiceArm();
-        if (!armed.ok) throw classifyIpcFailure(armed.code, armed.message);
-        engineActiveRef.current = true;
-        const begun = await voiceBegin();
-        if (!begun.ok) throw classifyIpcFailure(begun.code, begun.message);
+        await commandQueueRef.current.run(async () => {
+          const armed = await voiceArm();
+          if (!armed.ok) throw classifyIpcFailure(armed.code, armed.message);
+          engineActiveRef.current = true;
+          if (sessionRef.current !== sessionId || modeRef.current !== "active") {
+            engineActiveRef.current = false;
+            await voiceCancel();
+            return;
+          }
+          const begun = await voiceBegin();
+          if (!begun.ok) {
+            engineActiveRef.current = false;
+            throw classifyIpcFailure(begun.code, begun.message);
+          }
+        });
         if (sessionRef.current !== sessionId || modeRef.current !== "active") {
           disposeCurrentResources();
           await cancelEngine();
@@ -434,9 +499,9 @@ export function useMicCapture({
         source.connect(worklet);
         worklet.connect(mute);
         mute.connect(context.destination);
+        micTrace("capture graph connected", { contextRate: context.sampleRate });
         setState("listening");
       } catch (error) {
-        if (pendingContext) void pendingContext.close().catch(() => undefined);
         if (stream && resourcesRef.current === null) {
           for (const track of stream.getTracks()) track.stop();
         }
@@ -462,12 +527,36 @@ export function useMicCapture({
         await feedChainRef.current;
         if (!resources || sessionRef.current !== sessionId || modeRef.current !== "ending") return;
 
+        micTrace("stopping capture", {
+          inputBlocks: resources.inputBlocks,
+          inputSamples: resources.inputSamples,
+          peak: resources.peak,
+        });
+        if (resources.inputBlocks === 0) {
+          await failSession(sessionId, {
+            kind: "CAPTURE_FAILURE",
+            message: "The microphone worklet produced no audio blocks. Check the selected input device and try again.",
+          });
+          return;
+        }
+        if (resources.peak < SILENT_INPUT_PEAK) {
+          await failSession(sessionId, {
+            kind: "SILENT_INPUT",
+            message: "No microphone signal was detected. Check the input device and speak closer to the microphone.",
+          });
+          return;
+        }
+
         pushSamples(sessionId, resources, resources.resampler.flush());
         for (const chunk of resources.chunker.flush()) enqueueChunk(sessionId, chunk);
         await feedChainRef.current;
         if (sessionRef.current !== sessionId || modeRef.current !== "ending") return;
 
-        const ended = await voiceEnd();
+        const ended = await commandQueueRef.current.run(async () => {
+          if (sessionRef.current !== sessionId || modeRef.current !== "ending") return null;
+          return voiceEnd();
+        });
+        if (!ended) return;
         engineActiveRef.current = false;
         if (!ended.ok) {
           await failSession(sessionId, classifyIpcFailure(ended.code, ended.message));
@@ -498,7 +587,7 @@ export function useMicCapture({
     void (async () => {
       try {
         const result = await prepareVoiceModels();
-        if (!mountedRef.current) return;
+        if (!mountedRef.current.isMounted()) return;
         if (result.ok) {
           modeRef.current = "idle";
           setFailure(null);
@@ -507,23 +596,34 @@ export function useMicCapture({
           setFailure(classifyIpcFailure(result.code, result.message));
         }
       } catch (error) {
-        if (mountedRef.current) setFailure(classifyCaptureError(error));
+        if (mountedRef.current.isMounted()) setFailure(classifyCaptureError(error));
       } finally {
-        if (mountedRef.current) setPreparing(false);
+        if (mountedRef.current.isMounted()) setPreparing(false);
       }
     })();
   }, [failure, preparing, setState]);
 
   useEffect(() => {
+    // Re-arm on every effect run: React StrictMode's development double
+    // mount runs setup → cleanup → setup on the same instance, and the
+    // cleanup below unconditionally disarms. Without this line the hook
+    // stays dead for the app's lifetime and every setState is a no-op.
+    // Idiom: useVoicePlayback's subscription effect (mountedRef.current
+    // = true at setup). Lifecycle verified by tests/mounted-guard.test.ts.
+    mountedRef.current.arm();
     let unsubscribe: (() => void) | null = null;
     try {
       unsubscribe = subscribeVoiceEvents((event: VoiceEventPayload) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current.isMounted()) return;
         if (event.kind === "state") {
           if (event.state === "listening" && modeRef.current === "active") setState("listening");
           if (event.state === "transcribing" && modeRef.current !== "cancelled") setState("transcribing");
           if (event.state === "cancelled" && modeRef.current !== "failed") setState("cancelled");
-          if (event.state === "failed" && modeRef.current !== "cancelled") setState("failed");
+          if (event.state === "cancelled") engineActiveRef.current = false;
+          if (event.state === "failed" && modeRef.current !== "cancelled") {
+            engineActiveRef.current = false;
+            setState("failed");
+          }
           return;
         }
         if (event.kind === "partial") {
@@ -551,6 +651,7 @@ export function useMicCapture({
             modeRef.current = "cancelled";
             setState("cancelled");
           } else {
+            engineActiveRef.current = false;
             modeRef.current = "failed";
             setState("failed");
           }
@@ -563,7 +664,7 @@ export function useMicCapture({
       // the bridge absence is surfaced when the user explicitly starts.
     }
     return () => {
-      mountedRef.current = false;
+      mountedRef.current.disarm();
       modeRef.current = "cancelled";
       sessionRef.current += 1;
       disposeCurrentResources();

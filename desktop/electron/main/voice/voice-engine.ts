@@ -548,6 +548,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
   const begin = async (): Promise<VoiceEngineOutcome> => {
     const guard = requireState("armed");
     if (guard) return guard;
+    trace("[voice] STT begin requested");
     const init = await loadStt();
     if ("error" in init) {
       failMachine(init.code, init.error);
@@ -563,6 +564,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
     }
     try {
       transport.send(streamRequest.value);
+      trace("[voice] STT stream opened");
     } catch (error) {
       failMachine(
         "STT_FAILURE",
@@ -598,6 +600,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
   const end = async (): Promise<IpcResult<{ state: VoiceState; transcript: string }>> => {
     const guard = requireState("listening");
     if (guard) return ipcError(guard.code, guard.message);
+    trace("[voice] STT end requested");
     const response = await dispatchAwaiting("session", "stt", { type: "stt-end" }, streamTimeout);
     if (!response || response.type !== "stt-final") {
       const failure = machine.getFailure();
@@ -608,6 +611,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
       return ipcError("STT_FAILURE", message);
     }
     const transcript = response.transcript.slice(0, TRANSCRIPT_MAX);
+    trace(`[voice] STT final received (${transcript.length} chars)`);
     const finalize = machine.dispatch({ type: "end_capture" });
     if (!finalize.ok) {
       return ipcError("VOICE_STATE", clamp(finalize.reason, STATUS_MESSAGE_MAX));
@@ -628,6 +632,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
 
   const cancel = (): VoiceEngineOutcome => {
     const state = machine.getState();
+    trace(`[voice] cancel requested in ${state}`);
     if (state === "speaking") abortSynthesis();
     if (state === "listening" || state === "armed") killTransport();
     settleAwaiting(null);
@@ -637,6 +642,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
 
   const stop = (): VoiceEngineOutcome => {
     const state = machine.getState();
+    trace(`[voice] stop requested in ${state}`);
     if (state === "speaking") abortSynthesis();
     settleAwaiting(null);
     speakingRequestId = null;
@@ -664,6 +670,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
     const guard = requireState("idle", "transcript_ready");
     if (guard) return guard;
     const bounded = text.slice(0, TRANSCRIPT_MAX);
+    trace(`[voice] TTS requested (${bounded.length} chars, request ${requestId})`);
     const began = applyAction({ type: "speak_begin" });
     if (!began.ok) return began;
     speakingRequestId = requestId;
@@ -721,6 +728,7 @@ export function createVoiceEngine(deps: VoiceEngineDeps): VoiceEngine {
       speakingRequestId = null;
       return { ok: false, code: "TTS_FAILURE", message: "Synthesis did not finish in time." };
     }
+    trace(`[voice] TTS synthesis ended (${ended.totalSamples} samples @ ${ended.sampleRate} Hz, request ${requestId})`);
     if (ended.aborted) {
       // The user aborted mid-synthesis while still 'speaking': cancel is
       // the legal transition and records the cancellation honestly.

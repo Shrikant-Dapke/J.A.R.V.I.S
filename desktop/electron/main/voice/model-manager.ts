@@ -285,9 +285,11 @@ export function createModelManager(options: ModelManagerOptions): VoiceModelMana
         ? {
             // Exact-keyed by the protocol validators — insertion IS key
             // order in-process, so these literals are built pre-sorted.
-            decoder: join(dir(STT_MODEL), "decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx"),
-            encoder: join(dir(STT_MODEL), "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx"),
-            joiner: join(dir(STT_MODEL), "joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx"),
+            // NOTE: filenames must match the STT model's manifest files
+            // (stt-zipformer-en-2023-06-21-int8 → no chunk-size suffix).
+            decoder: join(dir(STT_MODEL), "decoder-epoch-99-avg-1.int8.onnx"),
+            encoder: join(dir(STT_MODEL), "encoder-epoch-99-avg-1.int8.onnx"),
+            joiner: join(dir(STT_MODEL), "joiner-epoch-99-avg-1.int8.onnx"),
             tokens: join(dir(STT_MODEL), "tokens.txt"),
           }
         : null,

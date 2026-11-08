@@ -95,6 +95,8 @@ export type IpcErrorCode =
   | "TTS_FAILURE"
   /** The user cancelled the active capture/synthesis. */
   | "RECORDING_CANCELLED"
+  /** The renderer could not open/resume an audio output device. */
+  | "AUDIO_OUTPUT_FAILURE"
   /** Microphone permission was denied (explicit, never assumed). */
   | "MICROPHONE_DENIED";
 
@@ -955,6 +957,7 @@ export const IPC_ERROR_COPY: Record<IpcErrorCode, string> = {
   STT_FAILURE: "Local speech recognition failed — no transcript was produced.",
   TTS_FAILURE: "Local speech synthesis failed — no audio was produced.",
   RECORDING_CANCELLED: "Cancelled. Nothing was recorded or spoken.",
+  AUDIO_OUTPUT_FAILURE: "Windows audio output could not be opened.",
   MICROPHONE_DENIED: "Microphone access was not granted.",
 };
 

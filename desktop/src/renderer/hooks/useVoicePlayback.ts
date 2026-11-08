@@ -38,7 +38,24 @@ type PlaybackSession = {
 };
 
 function userFailure(code: IpcErrorCode, fallback: string): VoicePlaybackFailure {
-  return { code, message: errorCopy(code, fallback) };
+  const detailedCodes: ReadonlySet<IpcErrorCode> = new Set([
+    "VOICE_STATE",
+    "ENGINE_UNAVAILABLE",
+    "MODEL_MISSING",
+    "TTS_FAILURE",
+    "AUDIO_OUTPUT_FAILURE",
+  ]);
+  return {
+    code,
+    message: detailedCodes.has(code) && fallback.trim().length > 0 ? fallback : errorCopy(code, fallback),
+  };
+}
+
+function playbackTrace(message: string, details?: Record<string, unknown>): void {
+  // Keep diagnostics bounded and metadata-only; synthesized PCM and reply text
+  // never enter the console.
+  if (details) console.info(`[voice][tts] ${message}`, details);
+  else console.info(`[voice][tts] ${message}`);
 }
 
 export function useVoicePlayback(): VoicePlaybackView {
@@ -53,6 +70,7 @@ export function useVoicePlayback(): VoicePlaybackView {
   const activeRef = useRef<PlaybackSession | null>(null);
   const accumulatorRef = useRef<BoundedTtsAudioAccumulator | null>(null);
   const mainSynthesisActiveRef = useRef(false);
+  const synthesisPromiseRef = useRef<Promise<unknown> | null>(null);
   const contextRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
 
@@ -83,9 +101,11 @@ export function useVoicePlayback(): VoicePlaybackView {
   }, []);
 
   const cancelMainSynthesis = useCallback((): Promise<void> => {
-    if (!mainSynthesisActiveRef.current) return Promise.resolve();
+    const pending = synthesisPromiseRef.current;
+    if (!mainSynthesisActiveRef.current && !pending) return Promise.resolve();
     mainSynthesisActiveRef.current = false;
-    return ttsStop().then(() => undefined).catch(() => undefined);
+    const stop = ttsStop().then(() => undefined).catch(() => undefined);
+    return Promise.allSettled([stop, pending ?? Promise.resolve()]).then(() => undefined);
   }, []);
 
   const clearSession = useCallback((): void => {
@@ -110,12 +130,19 @@ export function useVoicePlayback(): VoicePlaybackView {
   );
 
   const playAudio = useCallback(
-    (session: PlaybackSession, samples: Float32Array, sampleRate: number): void => {
+    async (session: PlaybackSession, samples: Float32Array, sampleRate: number): Promise<void> => {
       if (tokenRef.current !== session.token || activeRef.current?.requestId !== session.requestId) return;
       try {
         const context = contextRef.current ?? new AudioContext();
         contextRef.current = context;
-        void context.resume().catch(() => undefined);
+        await context.resume();
+        if (tokenRef.current !== session.token || activeRef.current?.requestId !== session.requestId) return;
+        if (context.state !== "running") {
+          throw new Error(`AudioContext remained ${context.state} after resume.`);
+        }
+        if (!Number.isFinite(sampleRate) || sampleRate < 8_000 || sampleRate > 192_000) {
+          throw new Error(`TTS sample rate ${sampleRate} Hz is not supported by the audio output.`);
+        }
         const buffer = context.createBuffer(1, samples.length, sampleRate);
         buffer.getChannelData(0).set(samples);
         const source = context.createBufferSource();
@@ -131,9 +158,23 @@ export function useVoicePlayback(): VoicePlaybackView {
         };
         sourceRef.current = source;
         source.start();
+        playbackTrace("audio source started", {
+          requestId: session.requestId,
+          samples: samples.length,
+          sampleRate,
+          contextState: context.state,
+        });
         setState("playing");
-      } catch {
-        failCurrent(session.token, "TTS_FAILURE", "Synthesized audio could not be played.");
+      } catch (error) {
+        playbackTrace("audio output failed", {
+          requestId: session.requestId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        failCurrent(
+          session.token,
+          "AUDIO_OUTPUT_FAILURE",
+          `Synthesized audio could not be played: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     },
     [closeAudio, failCurrent, setState],
@@ -144,7 +185,11 @@ export function useVoicePlayback(): VoicePlaybackView {
       const boundedText = text.trim();
       if (boundedText.length === 0) return;
 
-      const previousActive = activeRef.current !== null || mainSynthesisActiveRef.current || sourceRef.current !== null;
+      const previousActive =
+        activeRef.current !== null ||
+        mainSynthesisActiveRef.current ||
+        synthesisPromiseRef.current !== null ||
+        sourceRef.current !== null;
       clearSession();
       const previousStop = previousActive ? cancelMainSynthesis() : Promise.resolve();
 
@@ -160,6 +205,7 @@ export function useVoicePlayback(): VoicePlaybackView {
       setActiveMessageId(messageId);
       setFailure(null);
       setState("preparing");
+      playbackTrace("playback requested", { requestId, characters: boundedText.length });
 
       // Construct/resume the context from the explicit speaker click. The
       // audio is not connected until synthesis has produced a complete,
@@ -167,12 +213,17 @@ export function useVoicePlayback(): VoicePlaybackView {
       try {
         contextRef.current = new AudioContext();
         void contextRef.current.resume().catch(() => undefined);
+        playbackTrace("output AudioContext created", {
+          requestId,
+          sampleRate: contextRef.current.sampleRate,
+          state: contextRef.current.state,
+        });
       } catch {
-        failCurrent(token, "TTS_FAILURE", "Audio playback is unavailable in this window.");
+        failCurrent(token, "AUDIO_OUTPUT_FAILURE", "Audio playback is unavailable in this window.");
         return;
       }
 
-      void (async () => {
+      const synthesisPromise = (async () => {
         await previousStop;
         if (tokenRef.current !== token || activeRef.current?.requestId !== requestId) return;
         setState("synthesizing");
@@ -182,13 +233,24 @@ export function useVoicePlayback(): VoicePlaybackView {
           if (tokenRef.current !== token || activeRef.current?.requestId !== requestId) return;
           mainSynthesisActiveRef.current = false;
           if (!result.ok) {
+            playbackTrace("synthesis failed", { requestId, code: result.code });
             failCurrent(token, result.code, result.message);
           }
         } catch {
           mainSynthesisActiveRef.current = false;
+          playbackTrace("synthesis IPC failed", { requestId });
           failCurrent(token, "TTS_FAILURE", "Speech synthesis could not be reached.");
         }
       })();
+      synthesisPromiseRef.current = synthesisPromise;
+      void synthesisPromise.then(
+        () => {
+          if (synthesisPromiseRef.current === synthesisPromise) synthesisPromiseRef.current = null;
+        },
+        () => {
+          if (synthesisPromiseRef.current === synthesisPromise) synthesisPromiseRef.current = null;
+        },
+      );
     },
     [cancelMainSynthesis, clearSession, failCurrent, setState],
   );
@@ -258,7 +320,12 @@ export function useVoicePlayback(): VoicePlaybackView {
             failCurrent(session.token, "TTS_FAILURE", result.reason);
             return;
           }
-          playAudio(session, result.value.samples, result.value.sampleRate);
+          playbackTrace("synthesis complete", {
+            requestId: event.requestId,
+            samples: result.value.samples.length,
+            sampleRate: result.value.sampleRate,
+          });
+          void playAudio(session, result.value.samples, result.value.sampleRate);
         }
       });
     } catch {

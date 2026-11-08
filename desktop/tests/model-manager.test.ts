@@ -214,7 +214,7 @@ test("prepareModels installs every required file atomically: download → verify
   const status = manager.status();
   assert.equal(status.sttPresent, true);
   assert.equal(status.ttsPresent, true);
-  assert.equal(status.sttPaths?.encoder, target(ROOT_STT.id, "encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx"));
+  assert.equal(status.sttPaths?.encoder, target(ROOT_STT.id, "encoder-epoch-99-avg-1.int8.onnx"));
   assert.equal(status.ttsPaths?.model, target(ROOT_TTS.id, "model.int8.onnx"));
   assert.equal(status.ttsPaths?.dataDir, target(ROOT_TTS.id, "espeak-ng-data"));
   assert.match(status.ttsPaths?.lexicon ?? "", /lexicon-us-en\.txt/);
